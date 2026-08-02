@@ -1,5 +1,6 @@
 #include <Arduboy2.h>
 #include <EEPROM.h>
+#include <MIDIUSB.h>
 #include <avr/interrupt.h>
 
 Arduboy2 arduboy;
@@ -84,10 +85,12 @@ static const char  PRESET_NAME[8][3] PROGMEM = {
 };
 static const int8_t PRESET_OCT[8] PROGMEM = { 0, -2, 0, 0, +1, -1, 0, 0 };
 
-uint8_t colPreset[COLS] = {0, 1, 2, 3, 4, 5, 6, 7};
+uint8_t colPreset[COLS] = {1, 4, 2, 3, 0, 5, 6, 7};  // col1=BS(oct-2 BD), col2=HI(oct+1 SN)
 uint8_t colVolume[COLS] = {8, 8, 8, 8, 8, 8, 8, 8};
+uint8_t colMidi[COLS]   = {1, 2, 3, 4, 5, 6, 7, 8};  // MIDI channel per column (1-16)
+uint8_t colMidiNote[COLS];  // currently sounding MIDI note per column; 0xFF=none
 
-uint8_t sndCurCol = 0, sndCurRow = 0;  // 0=preset row, 1=volume row
+uint8_t sndCurCol = 0, sndCurRow = 0;  // 0=preset, 1=volume, 2=midi ch
 
 // ── Playback ──────────────────────────────────────────────────────────────────
 bool     playing      = false;
@@ -169,10 +172,10 @@ uint8_t findFreeVoice() {
 
 // ── EEPROM layout (base offset 16 to clear Arduboy2 reserved bytes) ───────────
 // [0-1] magic  [2-321] grid  [322-833] patNote
-// [834-835] bpm  [836-843] colPreset  [844-851] colVolume
+// [834-835] bpm  [836-843] colPreset  [844-851] colVolume  [852-859] colMidi
 static const uint16_t EEPROM_BASE   = 16;
 static const uint8_t  EEPROM_MAGIC0 = 0xA7;
-static const uint8_t  EEPROM_MAGIC1 = 0x5C;
+static const uint8_t  EEPROM_MAGIC1 = 0x5D;  // bumped: added colMidi field
 
 // ── EEPROM save / load ────────────────────────────────────────────────────────
 void saveSong() {
@@ -193,6 +196,7 @@ void saveSong() {
   EEPROM.update(addr++, (uint8_t)(bpm >> 8));
   for (uint8_t i = 0; i < COLS; i++) EEPROM.update(addr++, colPreset[i]);
   for (uint8_t i = 0; i < COLS; i++) EEPROM.update(addr++, colVolume[i]);
+  for (uint8_t i = 0; i < COLS; i++) EEPROM.update(addr++, colMidi[i]);
 }
 
 void loadSong() {
@@ -207,6 +211,7 @@ void loadSong() {
   addr += 2;
   for (uint8_t i = 0; i < COLS; i++) colPreset[i] = EEPROM.read(addr++);
   for (uint8_t i = 0; i < COLS; i++) colVolume[i]  = EEPROM.read(addr++);
+  for (uint8_t i = 0; i < COLS; i++) colMidi[i]    = EEPROM.read(addr++);
 }
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
@@ -217,7 +222,8 @@ void setup() {
   arduboy.setFrameRate(30);
   memset(grid, 0xFF, sizeof(grid));
   memset(patNote, 0xFF, sizeof(patNote));
-  memset(colVoice, 0xFF, sizeof(colVoice));
+  memset(colVoice,    0xFF, sizeof(colVoice));
+  memset(colMidiNote, 0xFF, sizeof(colMidiNote));
   loadSong();
   audioBegin();
 }
@@ -367,6 +373,7 @@ void drawSound() {
   arduboy.drawFastHLine(0, CELL_H,       128, WHITE);
   arduboy.drawFastHLine(0, CELL_H * 2,   128, WHITE);
   arduboy.drawFastHLine(0, CELL_H * 3,   128, WHITE);
+  arduboy.drawFastHLine(0, CELL_H * 4,   128, WHITE);
 
   arduboy.setTextColor(WHITE);
   for (uint8_t c = 0; c < COLS; c++) {
@@ -406,11 +413,27 @@ void drawSound() {
     if (v < 10) arduboy.print(' ');
     arduboy.print(v);
   }
+  // MIDI channel row
+  for (uint8_t c = 0; c < COLS; c++) {
+    uint8_t cx = c * CELL_W;
+    uint8_t cy = CELL_H * 3;
+    bool cur = (c == sndCurCol && sndCurRow == 2);
+    if (cur) {
+      arduboy.fillRect(cx + 1, cy + 1, CELL_W - 2, CELL_H - 2, WHITE);
+      arduboy.setTextColor(BLACK);
+    } else {
+      arduboy.setTextColor(WHITE);
+    }
+    arduboy.setCursor(cx + 2, cy + 1);
+    uint8_t ch = colMidi[c];
+    if (ch < 10) arduboy.print(' ');
+    arduboy.print(ch);
+  }
   arduboy.setTextColor(WHITE);
 
-  arduboy.setCursor(2, CELL_H * 3 + 4);
-  arduboy.print(F("A:preset  A+<>:vol"));
-  arduboy.setCursor(2, CELL_H * 3 + 13);
+  arduboy.setCursor(2, CELL_H * 4 + 4);
+  arduboy.print(F("A:prs A+<>:vol/ch"));
+  arduboy.setCursor(2, CELL_H * 4 + 13);
   arduboy.print(F("B:back"));
 }
 
@@ -496,6 +519,27 @@ void doTapTempo() {
   }
 }
 
+// ── MIDI helpers ──────────────────────────────────────────────────────────────
+void midiNoteOn(uint8_t ch, uint8_t note, uint8_t vel) {
+  midiEventPacket_t ev = {0x09, (uint8_t)(0x90 | (ch - 1)), note, vel};
+  MidiUSB.sendMIDI(ev);
+}
+
+void midiNoteOff(uint8_t ch, uint8_t note) {
+  midiEventPacket_t ev = {0x08, (uint8_t)(0x80 | (ch - 1)), note, 0};
+  MidiUSB.sendMIDI(ev);
+}
+
+void allMidiOff() {
+  for (uint8_t c = 0; c < COLS; c++) {
+    if (colMidiNote[c] != 0xFF) {
+      midiNoteOff(colMidi[c], colMidiNote[c]);
+      colMidiNote[c] = 0xFF;
+    }
+  }
+  MidiUSB.flush();
+}
+
 // ── Playback engine ───────────────────────────────────────────────────────────
 void stepPlay() {
   uint32_t now    = millis();
@@ -508,8 +552,10 @@ void stepPlay() {
     if (patIdx == 0xFF || patIdx >= MAX_PATS) continue;
     uint8_t n = patNote[patIdx][playStep];
     if (n == NOTE_MUTE) {
-      if (colVoice[c] < MAX_VOICES) { voiceOff(colVoice[c]); colVoice[c] = 0xFF; }
+      if (colVoice[c] < MAX_VOICES)  { voiceOff(colVoice[c]); colVoice[c] = 0xFF; }
+      if (colMidiNote[c] != 0xFF)    { midiNoteOff(colMidi[c], colMidiNote[c]); colMidiNote[c] = 0xFF; }
     } else if (n != NOTE_EMPTY) {
+      // Internal voice (octave-shifted for hardware speaker)
       int8_t  oct = (int8_t)pgm_read_byte(&PRESET_OCT[colPreset[c]]);
       int16_t adj = (int16_t)n + (int16_t)oct * 12;
       if (adj < NOTE_MIN) adj = NOTE_MIN;
@@ -519,9 +565,15 @@ void stepPlay() {
         if (colVoice[c] >= MAX_VOICES) colVoice[c] = findFreeVoice();
         if (colVoice[c] < MAX_VOICES)  voiceOn(colVoice[c], freq);
       }
+      // MIDI output — raw pattern note, no octave shift (DAW has its own mapping)
+      if (colMidiNote[c] != 0xFF) midiNoteOff(colMidi[c], colMidiNote[c]);
+      uint8_t vel = (uint8_t)((uint16_t)colVolume[c] * 127 / 10);
+      midiNoteOn(colMidi[c], n, vel);
+      colMidiNote[c] = n;
     }
-    // NOTE_EMPTY: sustain — leave voice running
+    // NOTE_EMPTY: sustain — leave voice and MIDI note running
   }
+  MidiUSB.flush();
 
   if (++playStep >= PAT_STEPS) {
     playStep = 0;
@@ -550,6 +602,7 @@ bool handlePlayStop() {
     memset(colVoice, 0xFF, sizeof(colVoice));
   } else {
     allVoicesOff();
+    allMidiOff();
     memset(colVoice, 0xFF, sizeof(colVoice));
   }
   resetInputState();
@@ -731,10 +784,13 @@ void handleSoundInput() {
     } else if (!noDir && sndCurRow == 1) {
       if (checkRepeat(LEFT_BUTTON,  2) && colVolume[sndCurCol] > 0)  colVolume[sndCurCol]--;
       if (checkRepeat(RIGHT_BUTTON, 3) && colVolume[sndCurCol] < 10) colVolume[sndCurCol]++;
+    } else if (!noDir && sndCurRow == 2) {
+      if (checkRepeat(LEFT_BUTTON,  2) && colMidi[sndCurCol] > 1)   colMidi[sndCurCol]--;
+      if (checkRepeat(RIGHT_BUTTON, 3) && colMidi[sndCurCol] < 16)  colMidi[sndCurCol]++;
     }
   } else {
     if (checkRepeat(UP_BUTTON,    0) && sndCurRow > 0)        sndCurRow--;
-    if (checkRepeat(DOWN_BUTTON,  1) && sndCurRow < 1)        sndCurRow++;
+    if (checkRepeat(DOWN_BUTTON,  1) && sndCurRow < 2)        sndCurRow++;
     if (checkRepeat(LEFT_BUTTON,  2) && sndCurCol > 0)        sndCurCol--;
     if (checkRepeat(RIGHT_BUTTON, 3) && sndCurCol < COLS - 1) sndCurCol++;
   }
