@@ -1,9 +1,8 @@
 #include <Arduboy2.h>
-#include <ArduboyTones.h>
 #include <EEPROM.h>
+#include <avr/interrupt.h>
 
 Arduboy2 arduboy;
-ArduboyTones sound(arduboy.audio.enabled);
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 static const uint8_t CELL_H     = 9;
@@ -101,6 +100,73 @@ static const uint16_t NOTE_FREQS[12] PROGMEM = {
   262, 277, 294, 311, 330, 349, 370, 392, 415, 440, 466, 494
 };
 
+// ── Audio engine ──────────────────────────────────────────────────────────────
+static const uint8_t  MAX_VOICES  = 4;
+static const uint32_t SAMPLE_RATE = 40000UL;
+
+volatile uint16_t voiceDelta[MAX_VOICES];
+volatile uint8_t  voiceActive[MAX_VOICES];
+uint8_t colVoice[COLS];  // 0xFF = no voice assigned
+
+ISR(TIMER3_COMPA_vect) {
+  static uint16_t ph[MAX_VOICES];
+  ph[0] += voiceDelta[0]; ph[1] += voiceDelta[1];
+  ph[2] += voiceDelta[2]; ph[3] += voiceDelta[3];
+  uint8_t out = ((uint8_t)(ph[0] >> 15) & voiceActive[0])
+              ^ ((uint8_t)(ph[1] >> 15) & voiceActive[1])
+              ^ ((uint8_t)(ph[2] >> 15) & voiceActive[2])
+              ^ ((uint8_t)(ph[3] >> 15) & voiceActive[3]);
+  if (out) { PORTC = (PORTC | (1 << 6)) & ~(1 << 7); }
+  else     { PORTC = (PORTC & ~(1 << 6)) | (1 << 7); }
+}
+
+void audioBegin() {
+  DDRC  |=  (1 << 6) | (1 << 7);
+  PORTC &= ~((1 << 6) | (1 << 7));
+  TCCR3A = 0;
+  TCCR3B = (1 << WGM32) | (1 << CS30);  // CTC, prescaler=1
+  OCR3A  = (uint16_t)(F_CPU / SAMPLE_RATE) - 1;  // 399 at 40kHz
+  // TIMSK3 stays 0; voiceOn() enables it when a note starts
+}
+
+void voiceOn(uint8_t v, uint16_t freq) {
+  uint16_t delta = (uint16_t)((uint32_t)freq * 65536UL / SAMPLE_RATE);
+  cli();
+  voiceDelta[v]  = delta;
+  voiceActive[v] = 1;
+  TIMSK3         = (1 << OCIE3A);
+  sei();
+}
+
+void voiceOff(uint8_t v) {
+  cli();
+  voiceActive[v] = 0;
+  if (!voiceActive[0] && !voiceActive[1] && !voiceActive[2] && !voiceActive[3]) {
+    TIMSK3 = 0;
+    PORTC &= ~((1 << 6) | (1 << 7));
+  }
+  sei();
+}
+
+void allVoicesOff() {
+  cli();
+  voiceActive[0] = voiceActive[1] = voiceActive[2] = voiceActive[3] = 0;
+  TIMSK3 = 0;
+  PORTC &= ~((1 << 6) | (1 << 7));
+  sei();
+}
+
+uint8_t findFreeVoice() {
+  bool busy[MAX_VOICES] = {};
+  for (uint8_t c = 0; c < COLS; c++) {
+    if (colVoice[c] < MAX_VOICES) busy[colVoice[c]] = true;
+  }
+  for (uint8_t v = 0; v < MAX_VOICES; v++) {
+    if (!busy[v]) return v;
+  }
+  return 0xFF;
+}
+
 // ── EEPROM layout (base offset 16 to clear Arduboy2 reserved bytes) ───────────
 // [0-1] magic  [2-321] grid  [322-833] patNote
 // [834-835] bpm  [836-843] colPreset  [844-851] colVolume
@@ -145,11 +211,15 @@ void loadSong() {
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
-  arduboy.begin();
+  arduboy.boot();  // skip boot logo/sound to avoid Timer3 ISR conflict
+  arduboy.clear();
+  arduboy.display();
   arduboy.setFrameRate(30);
   memset(grid, 0xFF, sizeof(grid));
   memset(patNote, 0xFF, sizeof(patNote));
+  memset(colVoice, 0xFF, sizeof(colVoice));
   loadSong();
+  audioBegin();
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -433,26 +503,24 @@ void stepPlay() {
   if (now - lastStepMs < stepMs) return;
   lastStepMs += stepMs;
 
-  uint8_t noteToPlay = NOTE_EMPTY;
   for (uint8_t c = 0; c < COLS; c++) {
     uint8_t patIdx = grid[playRow][c];
     if (patIdx == 0xFF || patIdx >= MAX_PATS) continue;
     uint8_t n = patNote[patIdx][playStep];
-    if (n == NOTE_MUTE) { noteToPlay = NOTE_MUTE; break; }
-    if (n != NOTE_EMPTY && noteToPlay == NOTE_EMPTY) {
-      int8_t  oct      = (int8_t)pgm_read_byte(&PRESET_OCT[colPreset[c]]);
-      int16_t adjusted = (int16_t)n + (int16_t)oct * 12;
-      if (adjusted < NOTE_MIN) adjusted = NOTE_MIN;
-      if (adjusted > NOTE_MAX) adjusted = NOTE_MAX;
-      noteToPlay = (uint8_t)adjusted;
+    if (n == NOTE_MUTE) {
+      if (colVoice[c] < MAX_VOICES) { voiceOff(colVoice[c]); colVoice[c] = 0xFF; }
+    } else if (n != NOTE_EMPTY) {
+      int8_t  oct = (int8_t)pgm_read_byte(&PRESET_OCT[colPreset[c]]);
+      int16_t adj = (int16_t)n + (int16_t)oct * 12;
+      if (adj < NOTE_MIN) adj = NOTE_MIN;
+      if (adj > NOTE_MAX) adj = NOTE_MAX;
+      uint16_t freq = midiToFreq((uint8_t)adj);
+      if (freq > 0) {
+        if (colVoice[c] >= MAX_VOICES) colVoice[c] = findFreeVoice();
+        if (colVoice[c] < MAX_VOICES)  voiceOn(colVoice[c], freq);
+      }
     }
-  }
-
-  if (noteToPlay == NOTE_MUTE) {
-    sound.noTone();
-  } else if (noteToPlay != NOTE_EMPTY) {
-    uint16_t freq = midiToFreq(noteToPlay);
-    if (freq > 0) sound.tone(freq, (uint16_t)(stepMs >> 1));
+    // NOTE_EMPTY: sustain — leave voice running
   }
 
   if (++playStep >= PAT_STEPS) {
@@ -474,8 +542,16 @@ bool handlePlayStop() {
                 (arduboy.justPressed(B_BUTTON) && arduboy.pressed(A_BUTTON));
   if (!abFire) return false;
   playing = !playing;
-  if (playing) { playStartRow = curRow; playRow = curRow; playStep = 0; lastStepMs = millis(); }
-  else         { sound.noTone(); }
+  if (playing) {
+    playStartRow = curRow;
+    playRow      = curRow;
+    playStep     = 0;
+    lastStepMs   = millis();
+    memset(colVoice, 0xFF, sizeof(colVoice));
+  } else {
+    allVoicesOff();
+    memset(colVoice, 0xFF, sizeof(colVoice));
+  }
   resetInputState();
   return true;
 }
