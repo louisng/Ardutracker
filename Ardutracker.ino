@@ -5,7 +5,7 @@ Arduboy2 arduboy;
 // ── Shared ────────────────────────────────────────────────────────────────────
 static const uint8_t CELL_H = 9;
 
-enum Screen : uint8_t { SCR_TRACKER, SCR_PATTERN };
+enum Screen : uint8_t { SCR_TRACKER, SCR_PATTERN, SCR_SETTINGS };
 Screen screen = SCR_TRACKER;
 
 uint8_t rptTimer[4];  // UP=0 DOWN=1 LEFT=2 RIGHT=3
@@ -34,36 +34,51 @@ static const uint8_t COLS     = 8;
 static const uint8_t ROWS     = 40;
 static const uint8_t VISIBLE  = 6;
 static const uint8_t CELL_W   = 16;
-static const uint8_t GRID_MAX = 0x1F;  // MAX_PATS - 1; max pattern index
+static const uint8_t GRID_MAX = 0x1F;
 
-uint8_t grid[ROWS][COLS];     // 0xFF = empty, 0x00–0x1F = pattern index
-uint8_t gridLastVal = 0x00;   // memory for A-alone paste on tracker
+uint8_t grid[ROWS][COLS];
+uint8_t gridLastVal = 0x00;
 
 uint8_t curCol = 0, curRow = 0, scrollTop = 0;
+
+// Tracker double-tap detection
+static const uint8_t DBL_WINDOW = 10;
+uint8_t gridTapTimer  = 0;
+bool    gridTapActive = false;
+uint8_t gridTapRow    = 0;
+uint8_t gridTapCol    = 0;
 
 // ── Pattern screen ────────────────────────────────────────────────────────────
 static const uint8_t MAX_PATS    = 32;
 static const uint8_t PAT_STEPS   = 16;
 static const uint8_t PAT_VISIBLE = 7;
 static const uint8_t PAT_COL_W   = 64;
-static const uint8_t NOTE_EMPTY  = 0xFF;  // blank step
-static const uint8_t NOTE_MUTE   = 0xFE;  // mute / stop command
-static const uint8_t NOTE_MIN    = 12;    // C0
-static const uint8_t NOTE_MAX    = 107;   // B7
+static const uint8_t NOTE_EMPTY  = 0xFF;
+static const uint8_t NOTE_MUTE   = 0xFE;
+static const uint8_t NOTE_MIN    = 12;
+static const uint8_t NOTE_MAX    = 107;
 
 uint8_t patNote[MAX_PATS][PAT_STEPS];
 
 uint8_t openPat     = 0;
 uint8_t patCurCol   = 0, patCurRow = 0, patScroll = 0;
-uint8_t patLastNote = 60;  // C4; memory resets to this on each entry
+uint8_t patLastNote = 60;
 
-// Tap / double-click detection (pattern screen, note column)
-static const uint8_t DBL_WINDOW = 10;  // frames (~0.33 s at 30 fps)
+// Pattern tap / double-tap detection
 uint8_t aTapTimer  = 0;
 bool    aTapActive = false;
-uint8_t aTapPrev   = NOTE_EMPTY;  // cell state before first tap
+uint8_t aTapPrev   = NOTE_EMPTY;
 uint8_t aTapRow    = 0;
 uint8_t aTapCol    = 0;
+
+// ── Settings screen ───────────────────────────────────────────────────────────
+static const uint16_t BPM_MIN = 20;
+static const uint16_t BPM_MAX = 300;
+uint16_t bpm = 80;
+
+uint32_t tapTimes[4];
+uint8_t  tapHead = 0;
+uint8_t  tapFill = 0;
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
@@ -87,7 +102,7 @@ void printNote(uint8_t note) {
   };
   arduboy.print(names[note % 12][0]);
   arduboy.print(names[note % 12][1]);
-  arduboy.print((char)('0' + note / 12 - 1));  // C4=60 → 60/12-1=4
+  arduboy.print((char)('0' + note / 12 - 1));
 }
 
 // ── Tracker draw ──────────────────────────────────────────────────────────────
@@ -160,18 +175,73 @@ void drawPattern() {
   arduboy.setTextColor(WHITE);
 }
 
+// ── Settings draw ─────────────────────────────────────────────────────────────
+void drawSettings() {
+  arduboy.drawRect(0, 0, 128, 64, WHITE);
+  arduboy.drawFastHLine(0, 10, 128, WHITE);
+
+  arduboy.setTextColor(WHITE);
+  arduboy.setCursor(34, 2);
+  arduboy.print(F("SETTINGS"));
+
+  arduboy.setCursor(4, 20);
+  arduboy.print(F("TEMPO"));
+
+  // BPM box (inverted)
+  arduboy.fillRect(60, 18, 38, 11, WHITE);
+  arduboy.setTextColor(BLACK);
+  arduboy.setCursor(63, 20);
+  if (bpm < 100) arduboy.print(' ');
+  arduboy.print(bpm);
+  arduboy.setTextColor(WHITE);
+  arduboy.setCursor(101, 20);
+  arduboy.print(F("BPM"));
+
+  // Tap dot indicator: filled circles for stored taps
+  for (uint8_t i = 0; i < 4; i++) {
+    uint8_t x = 60 + i * 8;
+    if (i < tapFill)
+      arduboy.fillCircle(x, 38, 2, WHITE);
+    else
+      arduboy.drawCircle(x, 38, 2, WHITE);
+  }
+
+  arduboy.setCursor(4, 50);
+  arduboy.print(F("B:back  A:tap"));
+}
+
 // ── Tracker cell edit ─────────────────────────────────────────────────────────
 void editCell(int16_t delta) {
   uint8_t *v = &grid[curRow][curCol];
   int16_t next = (int16_t)((*v == 0xFF) ? 0x00 : *v) + delta;
-  if (next < 0x00)    next = 0x00;
+  if (next < 0x00)     next = 0x00;
   if (next > GRID_MAX) next = GRID_MAX;
   *v = (uint8_t)next;
-  gridLastVal = *v;  // keep memory in sync
+  gridLastVal = *v;
+}
+
+// ── Tracker double-tap handler ────────────────────────────────────────────────
+// Single tap on empty → paste gridLastVal.
+// Double tap on empty → clear back to 0xFF (undo paste).
+// Double tap on set   → clear to 0xFF.
+void handleGridTap() {
+  uint8_t *v = &grid[curRow][curCol];
+  bool doubleTap = gridTapActive && gridTapTimer > 0 &&
+                   curRow == gridTapRow && curCol == gridTapCol;
+  if (doubleTap) {
+    gridTapActive = false;
+    gridTapTimer  = 0;
+    *v = 0xFF;  // clear on any double-tap
+  } else {
+    gridTapRow    = curRow;
+    gridTapCol    = curCol;
+    gridTapActive = true;
+    gridTapTimer  = DBL_WINDOW;
+    if (*v == 0xFF) *v = gridLastVal;  // paste on blank
+  }
 }
 
 // ── Pattern note edit ─────────────────────────────────────────────────────────
-// Blank and mute cells both start from patLastNote before the delta is applied.
 void editPatNote(int16_t delta) {
   uint8_t *n = &patNote[openPat][patCurRow];
   uint8_t cur = (*n == NOTE_EMPTY || *n == NOTE_MUTE) ? patLastNote : *n;
@@ -183,11 +253,6 @@ void editPatNote(int16_t delta) {
 }
 
 // ── Pattern A-tap handler ─────────────────────────────────────────────────────
-// Single tap on blank  → paste patLastNote.
-// Double tap on blank  → set mute (overrides the paste from first tap).
-// Double tap on note   → clear to blank.
-// Double tap on mute   → clear to blank.
-// "Double" requires both taps on the same cell within DBL_WINDOW frames.
 void handleATap() {
   uint8_t *n = &patNote[openPat][patCurRow];
   bool doubleTap = aTapActive && aTapTimer > 0 &&
@@ -197,19 +262,47 @@ void handleATap() {
     aTapTimer  = 0;
     *n = (aTapPrev == NOTE_EMPTY) ? NOTE_MUTE : NOTE_EMPTY;
   } else {
-    // First tap: record state, start window
     aTapPrev   = *n;
     aTapRow    = patCurRow;
     aTapCol    = patCurCol;
     aTapActive = true;
     aTapTimer  = DBL_WINDOW;
-    if (*n == NOTE_EMPTY) *n = patLastNote;  // paste on blank
-    // note or mute: no immediate single-tap action
+    if (*n == NOTE_EMPTY) *n = patLastNote;
+  }
+}
+
+// ── BPM helpers ───────────────────────────────────────────────────────────────
+void adjustBPM(int16_t delta) {
+  int16_t next = (int16_t)bpm + delta;
+  if (next < (int16_t)BPM_MIN) next = BPM_MIN;
+  if (next > (int16_t)BPM_MAX) next = BPM_MAX;
+  bpm = (uint16_t)next;
+}
+
+void doTapTempo() {
+  uint32_t now = millis();
+  tapTimes[tapHead] = now;
+  tapHead = (tapHead + 1) & 3;
+  if (tapFill < 4) tapFill++;
+
+  if (tapFill >= 2) {
+    // span between oldest and newest stored tap
+    uint8_t oldest = (tapFill < 4) ? 0 : tapHead;
+    uint32_t span = now - tapTimes[oldest];
+    uint32_t avg  = span / (tapFill - 1);
+    if (avg > 0) {
+      uint32_t computed = 60000UL / avg;
+      if (computed < BPM_MIN) computed = BPM_MIN;
+      if (computed > BPM_MAX) computed = BPM_MAX;
+      bpm = (uint16_t)computed;
+    }
   }
 }
 
 // ── Tracker input ─────────────────────────────────────────────────────────────
 void handleTrackerInput() {
+  if (gridTapTimer > 0) gridTapTimer--;
+
   bool aHeld = arduboy.pressed(A_BUTTON);
   bool bHeld = arduboy.pressed(B_BUTTON);
   bool noDir = !arduboy.pressed(UP_BUTTON)   && !arduboy.pressed(DOWN_BUTTON) &&
@@ -219,10 +312,10 @@ void handleTrackerInput() {
 
   if (aHeld) {
     if (noDir && arduboy.justPressed(A_BUTTON)) {
-      // A alone: paste last value into an empty cell
-      uint8_t *v = &grid[curRow][curCol];
-      if (*v == 0xFF) *v = gridLastVal;
+      handleGridTap();
     } else if (!noDir) {
+      gridTapActive = false;
+      gridTapTimer  = 0;
       if (checkRepeat(UP_BUTTON,    0)) editCell(+0x10);
       if (checkRepeat(DOWN_BUTTON,  1)) editCell(-0x10);
       if (checkRepeat(LEFT_BUTTON,  2)) editCell(-0x01);
@@ -242,6 +335,11 @@ void handleTrackerInput() {
         resetInputState();
         screen = SCR_PATTERN;
       }
+    } else if (arduboy.justPressed(LEFT_BUTTON)) {
+      tapHead = 0;
+      tapFill = 0;
+      resetInputState();
+      screen = SCR_SETTINGS;
     }
   } else {
     if (checkRepeat(UP_BUTTON, 0) && curRow > 0) {
@@ -281,7 +379,6 @@ void handlePatternInput() {
       if (noDir && arduboy.justPressed(A_BUTTON)) {
         handleATap();
       } else if (!noDir) {
-        // Direction pressed: cancel pending tap, edit pitch
         aTapActive = false;
         aTapTimer  = 0;
         if (checkRepeat(UP_BUTTON,    0)) editPatNote(+12);
@@ -304,19 +401,53 @@ void handlePatternInput() {
   }
 }
 
+// ── Settings input ────────────────────────────────────────────────────────────
+void handleSettingsInput() {
+  if (arduboy.justPressed(B_BUTTON)) {
+    resetInputState();
+    screen = SCR_TRACKER;
+    return;
+  }
+
+  bool aHeld = arduboy.pressed(A_BUTTON);
+  bool noDir = !arduboy.pressed(UP_BUTTON)   && !arduboy.pressed(DOWN_BUTTON) &&
+               !arduboy.pressed(LEFT_BUTTON) && !arduboy.pressed(RIGHT_BUTTON);
+
+  if (aHeld != aWasPressed) { resetInputState(); aWasPressed = aHeld; }
+
+  if (aHeld) {
+    if (noDir && arduboy.justPressed(A_BUTTON)) {
+      doTapTempo();
+    } else if (!noDir) {
+      if (checkRepeat(UP_BUTTON,    0)) adjustBPM(+10);
+      if (checkRepeat(DOWN_BUTTON,  1)) adjustBPM(-10);
+      if (checkRepeat(LEFT_BUTTON,  2)) adjustBPM(-1);
+      if (checkRepeat(RIGHT_BUTTON, 3)) adjustBPM(+1);
+    }
+  }
+}
+
 // ── Main loop ─────────────────────────────────────────────────────────────────
 void loop() {
   if (!arduboy.nextFrame()) return;
   arduboy.pollButtons();
 
-  if (screen == SCR_TRACKER) {
-    handleTrackerInput();
-    arduboy.clear();
-    drawTracker();
-  } else {
-    handlePatternInput();
-    arduboy.clear();
-    drawPattern();
+  switch (screen) {
+    case SCR_TRACKER:
+      handleTrackerInput();
+      arduboy.clear();
+      drawTracker();
+      break;
+    case SCR_PATTERN:
+      handlePatternInput();
+      arduboy.clear();
+      drawPattern();
+      break;
+    case SCR_SETTINGS:
+      handleSettingsInput();
+      arduboy.clear();
+      drawSettings();
+      break;
   }
   arduboy.display();
 }
