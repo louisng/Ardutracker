@@ -87,10 +87,15 @@ static const char  PRESET_NAME[8][3] PROGMEM = {
 static const int8_t  DEF_PRESET_OCT[8] PROGMEM = {  0, -2,  0,  0, +1, -1,  0,  0 };
 static const uint8_t DEF_PRESET_PW[8]  PROGMEM = {  4,  4,  3,  5,  2,  4,  2,  6 };
 // PW 1-8: 1=12.5% (thin/bright), 4=50% (square), 8=~100% (fat)
+// Waveforms: 0=SQ (square), 1=TR (triangle PDM), 2=SA (sawtooth PDM), 3=NO (noise LFSR)
+static const char    WAVE_NAMES[4][3]    PROGMEM = { "SQ","TR","SA","NO" };
+static const uint8_t DEF_PRESET_WAVE[8] PROGMEM = {  0,   0,   0,   1,   3,   0,   3,   1  };
+// LD=SQ, BS=SQ, AP=SQ, CH=TR, HI=NO, LO=SQ, PC=NO, PD=TR
 
-int8_t  presetOct[8];  // editable per-preset octave offset
-uint8_t presetPW[8];   // editable per-preset pulse width (1-8)
-uint8_t editPreset = 0, editParam = 0;  // preset editor state
+int8_t  presetOct[8];   // editable per-preset octave offset
+uint8_t presetPW[8];    // editable per-preset pulse width (1-8)
+uint8_t presetWave[8];  // editable per-preset waveform (0-3)
+uint8_t editPreset = 0, editParam = 0;  // preset editor state (editParam: 0=OCT,1=PW,2=WAVE)
 
 uint8_t colPreset[COLS] = {1, 4, 2, 3, 0, 5, 6, 7};  // col1=BS(BD), col2=HI(SN)
 uint8_t colMute[COLS]   = {0, 0, 0, 0, 0, 0, 0, 0};   // 0=active, 1=muted (speaker only)
@@ -116,18 +121,39 @@ static const uint32_t SAMPLE_RATE = 40000UL;
 
 volatile uint16_t voiceDelta[MAX_VOICES];
 volatile uint8_t  voiceActive[MAX_VOICES];
-volatile uint8_t  voicePW[MAX_VOICES];  // duty threshold 0-255 (128 = 50% square)
+volatile uint8_t  voicePW[MAX_VOICES];    // duty threshold 0-255 (128 = 50% square)
+volatile uint8_t  voiceWave[MAX_VOICES];  // 0=square, 1=triangle, 2=sawtooth, 3=noise
+volatile int16_t  voiceErr[MAX_VOICES];   // PDM error accumulators for TR/SA
 uint8_t colVoice[COLS];  // 0xFF = no voice assigned
 
 ISR(TIMER3_COMPA_vect) {
   static uint16_t ph[MAX_VOICES];
-  ph[0] += voiceDelta[0]; ph[1] += voiceDelta[1];
-  ph[2] += voiceDelta[2]; ph[3] += voiceDelta[3];
-  // Duty cycle: voice is "on" when high byte of phase < voicePW threshold
-  uint8_t out = (((uint8_t)(ph[0] >> 8) < voicePW[0]) & voiceActive[0])
-              ^ (((uint8_t)(ph[1] >> 8) < voicePW[1]) & voiceActive[1])
-              ^ (((uint8_t)(ph[2] >> 8) < voicePW[2]) & voiceActive[2])
-              ^ (((uint8_t)(ph[3] >> 8) < voicePW[3]) & voiceActive[3]);
+  static uint16_t nsr[MAX_VOICES] = {0xACE1, 0x7E5B, 0x3CA9, 0x1F83};  // noise LFSR state
+  uint8_t out = 0;
+  for (uint8_t v = 0; v < MAX_VOICES; v++) {
+    if (!voiceActive[v]) continue;
+    ph[v] += voiceDelta[v];
+    uint8_t bit;
+    uint8_t w = voiceWave[v];
+    if (w == 0) {
+      bit = ((uint8_t)(ph[v] >> 8) < voicePW[v]);
+    } else if (w == 1) {
+      uint16_t p  = ph[v];
+      uint8_t tri = (p < 0x8000) ? (uint8_t)(p >> 7) : (uint8_t)((0xFFFF - p) >> 7);
+      int16_t e   = voiceErr[v] + ((int16_t)tri - 128);
+      bit          = (e >= 0);
+      voiceErr[v]  = e - (bit ? 256 : 0);
+    } else if (w == 2) {
+      uint8_t saw = (uint8_t)(ph[v] >> 8);
+      int16_t e   = voiceErr[v] + ((int16_t)saw - 128);
+      bit          = (e >= 0);
+      voiceErr[v]  = e - (bit ? 256 : 0);
+    } else {
+      nsr[v] = (nsr[v] >> 1) ^ (uint16_t)(-(nsr[v] & 1u) & 0xB400u);
+      bit     = (uint8_t)(nsr[v] & 1u);
+    }
+    out ^= bit;
+  }
   if (out) { PORTC = (PORTC | (1 << 6)) & ~(1 << 7); }
   else     { PORTC = (PORTC & ~(1 << 6)) | (1 << 7); }
 }
@@ -135,18 +161,24 @@ ISR(TIMER3_COMPA_vect) {
 void audioBegin() {
   DDRC  |=  (1 << 6) | (1 << 7);
   PORTC &= ~((1 << 6) | (1 << 7));
-  for (uint8_t v = 0; v < MAX_VOICES; v++) voicePW[v] = 128;  // default 50% duty
+  for (uint8_t v = 0; v < MAX_VOICES; v++) {
+    voicePW[v]   = 128;
+    voiceWave[v] = 0;
+    voiceErr[v]  = 0;
+  }
   TCCR3A = 0;
   TCCR3B = (1 << WGM32) | (1 << CS30);  // CTC, prescaler=1
   OCR3A  = (uint16_t)(F_CPU / SAMPLE_RATE) - 1;  // 399 at 40kHz
   // TIMSK3 stays 0; voiceOn() enables it when a note starts
 }
 
-void voiceOn(uint8_t v, uint16_t freq, uint8_t pw) {
+void voiceOn(uint8_t v, uint16_t freq, uint8_t pw, uint8_t wave) {
   uint16_t delta = (uint16_t)((uint32_t)freq * 65536UL / SAMPLE_RATE);
   cli();
   voiceDelta[v]  = delta;
   voicePW[v]     = pw;
+  voiceWave[v]   = wave;
+  voiceErr[v]    = 0;
   voiceActive[v] = 1;
   TIMSK3         = (1 << OCIE3A);
   sei();
@@ -184,10 +216,10 @@ uint8_t findFreeVoice() {
 // ── EEPROM layout (base offset 16 to clear Arduboy2 reserved bytes) ───────────
 // [0-1] magic  [2-321] grid  [322-833] patNote
 // [834-835] bpm  [836-843] colPreset  [844-851] colMute  [852-859] colMidi
-// [860-867] presetOct  [868-875] presetPW
+// [860-867] presetOct  [868-875] presetPW  [876-883] presetWave
 static const uint16_t EEPROM_BASE   = 16;
 static const uint8_t  EEPROM_MAGIC0 = 0xA7;
-static const uint8_t  EEPROM_MAGIC1 = 0x5E;  // bumped: mute+preset params
+static const uint8_t  EEPROM_MAGIC1 = 0x5F;  // bumped: added waveform per preset
 
 // ── EEPROM save / load ────────────────────────────────────────────────────────
 void saveSong() {
@@ -211,6 +243,7 @@ void saveSong() {
   for (uint8_t i = 0; i < COLS; i++) EEPROM.update(addr++, colMidi[i]);
   for (uint8_t i = 0; i < 8;    i++) EEPROM.update(addr++, (uint8_t)presetOct[i]);
   for (uint8_t i = 0; i < 8;    i++) EEPROM.update(addr++, presetPW[i]);
+  for (uint8_t i = 0; i < 8;    i++) EEPROM.update(addr++, presetWave[i]);
 }
 
 void loadSong() {
@@ -226,8 +259,9 @@ void loadSong() {
   for (uint8_t i = 0; i < COLS; i++) colPreset[i] = EEPROM.read(addr++);
   for (uint8_t i = 0; i < COLS; i++) colMute[i]   = EEPROM.read(addr++);
   for (uint8_t i = 0; i < COLS; i++) colMidi[i]   = EEPROM.read(addr++);
-  for (uint8_t i = 0; i < 8;    i++) presetOct[i] = (int8_t)EEPROM.read(addr++);
-  for (uint8_t i = 0; i < 8;    i++) presetPW[i]  = EEPROM.read(addr++);
+  for (uint8_t i = 0; i < 8;    i++) presetOct[i]  = (int8_t)EEPROM.read(addr++);
+  for (uint8_t i = 0; i < 8;    i++) presetPW[i]   = EEPROM.read(addr++);
+  for (uint8_t i = 0; i < 8;    i++) presetWave[i] = EEPROM.read(addr++);
 }
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
@@ -241,8 +275,9 @@ void setup() {
   memset(colVoice,    0xFF, sizeof(colVoice));
   memset(colMidiNote, 0xFF, sizeof(colMidiNote));
   for (uint8_t i = 0; i < 8; i++) {
-    presetOct[i] = (int8_t)pgm_read_byte(&DEF_PRESET_OCT[i]);
-    presetPW[i]  = pgm_read_byte(&DEF_PRESET_PW[i]);
+    presetOct[i]  = (int8_t)pgm_read_byte(&DEF_PRESET_OCT[i]);
+    presetPW[i]   = pgm_read_byte(&DEF_PRESET_PW[i]);
+    presetWave[i] = pgm_read_byte(&DEF_PRESET_WAVE[i]);
   }
   loadSong();
   audioBegin();
@@ -583,10 +618,11 @@ void stepPlay() {
         if (adj > NOTE_MAX) adj = NOTE_MAX;
         uint16_t freq = midiToFreq((uint8_t)adj);
         // pw 1-8 → threshold 31-255: (pw*32)-1
-        uint8_t pw = (uint8_t)((uint16_t)presetPW[preset] * 32 - 1);
+        uint8_t pw   = (uint8_t)((uint16_t)presetPW[preset] * 32 - 1);
+        uint8_t wave = presetWave[preset];
         if (freq > 0) {
           if (colVoice[c] >= MAX_VOICES) colVoice[c] = findFreeVoice();
-          if (colVoice[c] < MAX_VOICES)  voiceOn(colVoice[c], freq, pw);
+          if (colVoice[c] < MAX_VOICES)  voiceOn(colVoice[c], freq, pw, wave);
         }
       }
       // MIDI output always sends regardless of mute (DAW controls its own volume)
@@ -840,6 +876,7 @@ void drawPreset() {
   arduboy.drawFastHLine(0,  9, 128, WHITE);
   arduboy.drawFastHLine(0, 18, 128, WHITE);
   arduboy.drawFastHLine(0, 27, 128, WHITE);
+  arduboy.drawFastHLine(0, 36, 128, WHITE);
 
   // Header: preset number + name
   arduboy.setTextColor(WHITE);
@@ -861,8 +898,8 @@ void drawPreset() {
     uint8_t ctrX   = SX + SW / 2;
     uint8_t col    = octSel ? BLACK : WHITE;
     arduboy.drawFastHLine(SX, 13, SW, col);
-    arduboy.drawFastVLine(ctrX, 12, 3, col);   // center tick
-    arduboy.fillRect(thumbX - 1, 11, 3, 5, col);  // thumb
+    arduboy.drawFastVLine(ctrX, 12, 3, col);
+    arduboy.fillRect(thumbX - 1, 11, 3, 5, col);
     arduboy.setCursor(102, 10);
     if (oct >= 0) arduboy.print('+');
     arduboy.print(oct);
@@ -875,22 +912,47 @@ void drawPreset() {
   arduboy.setCursor(3, 19);
   arduboy.print(F("PW "));
   {
-    uint8_t pw     = presetPW[p];
-    uint8_t fill   = (uint8_t)((uint16_t)(pw - 1) * SW / 7);
-    uint8_t col    = pwSel ? BLACK : WHITE;
+    uint8_t pw   = presetPW[p];
+    uint8_t fill = (uint8_t)((uint16_t)(pw - 1) * SW / 7);
+    uint8_t col  = pwSel ? BLACK : WHITE;
     arduboy.drawFastHLine(SX, 22, SW, col);
     if (fill > 0) arduboy.fillRect(SX, 20, fill, 5, col);
-    arduboy.drawFastVLine(SX + SW - 1, 21, 3, col);  // right-end tick
+    arduboy.drawFastVLine(SX + SW - 1, 21, 3, col);
     arduboy.setCursor(102, 19);
     arduboy.print(pw);
     arduboy.print(F("/8"));
   }
 
+  // WAVE selector row (y=27) — 4 options: SQ TR SA NO
   arduboy.setTextColor(WHITE);
-  arduboy.setCursor(4, 30);
-  arduboy.print(F("ud:param  A+<>:change"));
-  arduboy.setCursor(4, 39);
-  arduboy.print(F("B:back  A:rst preset"));
+  bool waveSel = (editParam == 2);
+  if (waveSel) { arduboy.fillRect(1, 28, 126, 7, WHITE); arduboy.setTextColor(BLACK); }
+  arduboy.setCursor(3, 28);
+  arduboy.print(F("WV"));
+  {
+    uint8_t selWv = presetWave[p];
+    for (uint8_t i = 0; i < 4; i++) {
+      uint8_t wx = 28 + i * 25;
+      bool cur = (selWv == i);
+      if (cur) {
+        uint8_t bc = waveSel ? BLACK : WHITE;
+        uint8_t tc = waveSel ? WHITE : BLACK;
+        arduboy.fillRect(wx - 1, 28, 14, 7, bc);
+        arduboy.setTextColor(tc);
+      } else {
+        arduboy.setTextColor(waveSel ? BLACK : WHITE);
+      }
+      arduboy.setCursor(wx, 28);
+      arduboy.print((char)pgm_read_byte(&WAVE_NAMES[i][0]));
+      arduboy.print((char)pgm_read_byte(&WAVE_NAMES[i][1]));
+    }
+  }
+
+  arduboy.setTextColor(WHITE);
+  arduboy.setCursor(4, 38);
+  arduboy.print(F("ud:param  A+<>:edit"));
+  arduboy.setCursor(4, 47);
+  arduboy.print(F("B:back  A:rst prst"));
 }
 
 // ── Input: Preset Editor ──────────────────────────────────────────────────────
@@ -918,19 +980,23 @@ void handlePresetInput() {
       if (editParam == 0) {
         if (checkRepeat(LEFT_BUTTON,  2) && presetOct[editPreset] > -4) presetOct[editPreset]--;
         if (checkRepeat(RIGHT_BUTTON, 3) && presetOct[editPreset] < +4) presetOct[editPreset]++;
-      } else {
+      } else if (editParam == 1) {
         if (checkRepeat(LEFT_BUTTON,  2) && presetPW[editPreset] > 1) presetPW[editPreset]--;
         if (checkRepeat(RIGHT_BUTTON, 3) && presetPW[editPreset] < 8) presetPW[editPreset]++;
+      } else {
+        if (checkRepeat(LEFT_BUTTON,  2) && presetWave[editPreset] > 0) presetWave[editPreset]--;
+        if (checkRepeat(RIGHT_BUTTON, 3) && presetWave[editPreset] < 3) presetWave[editPreset]++;
       }
     }
   } else {
     if (justRelA && wasClean) {
       // Reset this preset to factory defaults
-      presetOct[editPreset] = (int8_t)pgm_read_byte(&DEF_PRESET_OCT[editPreset]);
-      presetPW[editPreset]  = pgm_read_byte(&DEF_PRESET_PW[editPreset]);
+      presetOct[editPreset]  = (int8_t)pgm_read_byte(&DEF_PRESET_OCT[editPreset]);
+      presetPW[editPreset]   = pgm_read_byte(&DEF_PRESET_PW[editPreset]);
+      presetWave[editPreset] = pgm_read_byte(&DEF_PRESET_WAVE[editPreset]);
     }
     if (checkRepeat(UP_BUTTON,    0) && editParam > 0) editParam--;
-    if (checkRepeat(DOWN_BUTTON,  1) && editParam < 1) editParam++;
+    if (checkRepeat(DOWN_BUTTON,  1) && editParam < 2) editParam++;
     if (checkRepeat(LEFT_BUTTON,  2)) editPreset = (editPreset + 7) & 7;
     if (checkRepeat(RIGHT_BUTTON, 3)) editPreset = (editPreset + 1) & 7;
   }
