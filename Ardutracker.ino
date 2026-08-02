@@ -623,8 +623,8 @@ void allMidiOff() {
 }
 
 // ── FX Flash driver ───────────────────────────────────────────────────────────
-static inline void fxSel()   { SPI.beginTransaction(FX_SPI); PORTD &= ~(1 << 7); }
-static inline void fxDesel() { PORTD |=  (1 << 7); SPI.endTransaction(); }
+static inline void fxSel()   { SPI.beginTransaction(FX_SPI); PORTE &= ~(1 << 6); }
+static inline void fxDesel() { PORTE |=  (1 << 6); SPI.endTransaction(); }
 
 static void fxWaitBusy() {
   fxSel();
@@ -638,8 +638,8 @@ static void fxWren() {
 }
 
 void fxBegin() {
-  DDRD  |=  (1 << 7);
-  PORTD |=  (1 << 7);  // CS deselected
+  DDRE  |=  (1 << 6);   // PE6 = Arduino pin 7 = FX flash CS
+  PORTE |=  (1 << 6);   // CS deselected (high)
   SPI.begin();
 }
 
@@ -872,7 +872,6 @@ void handleTrackerInput() {
       screen = SCR_SOUND;
     } else if (arduboy.justPressed(DOWN_BUTTON)) {
       if (playing) { allVoicesOff(); allMidiOff(); playing = false; memset(colVoice, 0xFF, sizeof(colVoice)); }
-      saveSong();  // auto-backup to EEPROM before song manager
       songSlot   = 0;
       songScroll = 0;
       songNaming = false;
