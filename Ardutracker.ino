@@ -17,7 +17,8 @@ Screen screen = SCR_TRACKER;
 uint8_t rptTimer[4];
 static const uint8_t RPT_START = 20;
 static const uint8_t RPT_RATE  = 5;
-bool aWasPressed = false;
+bool aWasPressed  = false;
+bool aPressClean  = false;  // A was pressed without direction; fire tap on release
 
 bool checkRepeat(uint8_t btn, uint8_t idx) {
   if (arduboy.justPressed(btn)) { rptTimer[idx] = RPT_START; return true; }
@@ -33,6 +34,7 @@ bool checkRepeat(uint8_t btn, uint8_t idx) {
 void resetInputState() {
   memset(rptTimer, 0, sizeof(rptTimer));
   aWasPressed = false;
+  aPressClean = false;
 }
 
 // ── Tracker ───────────────────────────────────────────────────────────────────
@@ -89,9 +91,10 @@ uint8_t colVolume[COLS] = {8, 8, 8, 8, 8, 8, 8, 8};
 uint8_t sndCurCol = 0, sndCurRow = 0;  // 0=preset row, 1=volume row
 
 // ── Playback ──────────────────────────────────────────────────────────────────
-bool     playing    = false;
-uint8_t  playRow    = 0, playStep = 0;
-uint32_t lastStepMs = 0;
+bool     playing      = false;
+uint8_t  playRow      = 0, playStep = 0;
+uint8_t  playStartRow = 0;
+uint32_t lastStepMs   = 0;
 
 // C4-B4 frequencies (MIDI 60-71); octave-shift via bit shift
 static const uint16_t NOTE_FREQS[12] PROGMEM = {
@@ -454,7 +457,14 @@ void stepPlay() {
 
   if (++playStep >= PAT_STEPS) {
     playStep = 0;
-    if (++playRow >= ROWS) playRow = 0;  // loop
+    uint8_t nextRow = playRow + 1;
+    bool nextOk = false;
+    if (nextRow < ROWS) {
+      for (uint8_t c = 0; c < COLS; c++) {
+        if (grid[nextRow][c] != 0xFF) { nextOk = true; break; }
+      }
+    }
+    playRow = nextOk ? nextRow : playStartRow;
   }
 }
 
@@ -464,7 +474,7 @@ bool handlePlayStop() {
                 (arduboy.justPressed(B_BUTTON) && arduboy.pressed(A_BUTTON));
   if (!abFire) return false;
   playing = !playing;
-  if (playing) { playRow = 0; playStep = 0; lastStepMs = millis(); }
+  if (playing) { playStartRow = curRow; playRow = curRow; playStep = 0; lastStepMs = millis(); }
   else         { sound.noTone(); }
   resetInputState();
   return true;
@@ -474,6 +484,10 @@ bool handlePlayStop() {
 void handleTrackerInput() {
   if (gridTapTimer > 0) gridTapTimer--;
 
+  // Capture release state before any resetInputState() call clears aPressClean
+  bool justRelA = arduboy.justReleased(A_BUTTON);
+  bool wasClean = aPressClean;
+
   bool aHeld = arduboy.pressed(A_BUTTON);
   bool bHeld = arduboy.pressed(B_BUTTON);
   bool noDir = !arduboy.pressed(UP_BUTTON)   && !arduboy.pressed(DOWN_BUTTON) &&
@@ -482,9 +496,13 @@ void handleTrackerInput() {
   if (aHeld != aWasPressed) { resetInputState(); aWasPressed = aHeld; }
 
   if (aHeld) {
-    if (noDir && arduboy.justPressed(A_BUTTON)) {
-      handleGridTap();
+    if (arduboy.justPressed(A_BUTTON)) {
+      // Store non-empty cell to memory immediately on press
+      uint8_t v = grid[curRow][curCol];
+      if (v != 0xFF) gridLastVal = v;
+      aPressClean = noDir;
     } else if (!noDir) {
+      aPressClean   = false;
       gridTapActive = false;
       gridTapTimer  = 0;
       if (checkRepeat(UP_BUTTON,    0)) editCell(+0x10);
@@ -521,6 +539,7 @@ void handleTrackerInput() {
       screen = SCR_SETTINGS;
     }
   } else {
+    if (justRelA && wasClean) handleGridTap();  // paste/clear fires on release
     if (checkRepeat(UP_BUTTON, 0) && curRow > 0) {
       curRow--;
       if (curRow < scrollTop) scrollTop = curRow;
@@ -538,6 +557,10 @@ void handleTrackerInput() {
 void handlePatternInput() {
   if (aTapTimer > 0) aTapTimer--;
 
+  // Capture release state before any resetInputState() call clears aPressClean
+  bool justRelA = arduboy.justReleased(A_BUTTON);
+  bool wasClean = aPressClean;
+
   if (arduboy.justPressed(B_BUTTON)) {
     aTapActive  = false;
     aTapTimer   = 0;
@@ -554,19 +577,24 @@ void handlePatternInput() {
   if (aHeld != aWasPressed) { resetInputState(); aWasPressed = aHeld; }
 
   if (aHeld) {
-    if (patCurCol == 0) {
-      if (noDir && arduboy.justPressed(A_BUTTON)) {
-        handleATap();
-      } else if (!noDir) {
-        aTapActive = false;
-        aTapTimer  = 0;
-        if (checkRepeat(UP_BUTTON,    0)) editPatNote(+12);
-        if (checkRepeat(DOWN_BUTTON,  1)) editPatNote(-12);
-        if (checkRepeat(LEFT_BUTTON,  2)) editPatNote(-1);
-        if (checkRepeat(RIGHT_BUTTON, 3)) editPatNote(+1);
+    if (arduboy.justPressed(A_BUTTON)) {
+      // Store non-empty note to memory immediately on press
+      if (patCurCol == 0) {
+        uint8_t n = patNote[openPat][patCurRow];
+        if (n != NOTE_EMPTY && n != NOTE_MUTE) patLastNote = n;
       }
+      aPressClean = noDir;
+    } else if (patCurCol == 0 && !noDir) {
+      aPressClean = false;
+      aTapActive  = false;
+      aTapTimer   = 0;
+      if (checkRepeat(UP_BUTTON,    0)) editPatNote(+12);
+      if (checkRepeat(DOWN_BUTTON,  1)) editPatNote(-12);
+      if (checkRepeat(LEFT_BUTTON,  2)) editPatNote(-1);
+      if (checkRepeat(RIGHT_BUTTON, 3)) editPatNote(+1);
     }
   } else {
+    if (justRelA && wasClean && patCurCol == 0) handleATap();  // paste/clear on release
     if (checkRepeat(UP_BUTTON, 0) && patCurRow > 0) {
       patCurRow--;
       if (patCurRow < patScroll) patScroll = patCurRow;
