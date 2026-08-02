@@ -378,6 +378,13 @@ void drawPattern() {
   for (uint8_t r = 0; r <= PAT_VISIBLE; r++)
     arduboy.drawFastHLine(0, r * CELL_H, 128, WHITE);
 
+  // Extra pixel above beat-boundary rows (steps 4, 8, 12) to form a thicker divider
+  for (uint8_t vr = 0; vr < PAT_VISIBLE; vr++) {
+    uint8_t step = vr + patScroll;
+    if (step > 0 && step % 4 == 0)
+      arduboy.drawFastHLine(0, vr * CELL_H + 1, 128, WHITE);
+  }
+
   for (uint8_t vr = 0; vr < PAT_VISIBLE; vr++) {
     uint8_t step = vr + patScroll;
     if (step >= PAT_STEPS) break;
