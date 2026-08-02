@@ -115,13 +115,13 @@ static const uint32_t FX_SONG_BASE  = 0xFE0000UL;  // base address
 static const uint32_t FX_SLOT_SIZE  = 0x1000UL;    // 4096 bytes per slot (1 erase sector)
 static const uint8_t  SONG_SLOTS    = 32;
 static const uint8_t  SONGS_VIS     = 5;            // visible rows on songs screen
-static const SPISettings FX_SPI(8000000, MSBFIRST, SPI_MODE0);
 
 uint8_t songSlot    = 0;   // selected slot index (0-31)
 uint8_t songScroll  = 0;   // scroll offset for song list
 bool    songNaming  = false;
 uint8_t songNameCur = 0;   // cursor within name (0-5)
 char    songEditName[7];   // name being edited (null-terminated)
+static uint8_t songCache[SONGS_VIS][8];  // cached slot headers, refreshed on entry/scroll/save
 
 // ── Playback ──────────────────────────────────────────────────────────────────
 bool     playing      = false;
@@ -623,8 +623,8 @@ void allMidiOff() {
 }
 
 // ── FX Flash driver ───────────────────────────────────────────────────────────
-static inline void fxSel()   { SPI.beginTransaction(FX_SPI); PORTE &= ~(1 << 6); }
-static inline void fxDesel() { PORTE |=  (1 << 6); SPI.endTransaction(); }
+static inline void fxSel()   { PORTE &= ~(1 << 6); }
+static inline void fxDesel() { PORTE |=  (1 << 6); }
 
 static void fxWaitBusy() {
   fxSel();
@@ -683,6 +683,16 @@ bool fxSlotValid(uint8_t slot) {
   uint8_t m[2];
   fxRead(FX_SONG_BASE + (uint32_t)slot * FX_SLOT_SIZE, m, 2);
   return m[0] == EEPROM_MAGIC0 && m[1] == EEPROM_MAGIC1;
+}
+
+void refreshSongCache() {
+  for (uint8_t r = 0; r < SONGS_VIS; r++) {
+    uint8_t s = r + songScroll;
+    if (s < SONG_SLOTS)
+      fxRead(FX_SONG_BASE + (uint32_t)s * FX_SLOT_SIZE, songCache[r], 8);
+    else
+      memset(songCache[r], 0, 8);
+  }
 }
 
 void fxLoadSlot(uint8_t slot) {
@@ -876,6 +886,7 @@ void handleTrackerInput() {
       songScroll = 0;
       songNaming = false;
       resetInputState();
+      refreshSongCache();
       screen = SCR_SONGS;
       return;
     } else if (arduboy.justPressed(RIGHT_BUTTON)) {
@@ -1227,8 +1238,7 @@ void drawSongs() {
         }
       }
     } else {
-      uint8_t hdr[8];
-      fxRead(FX_SONG_BASE + (uint32_t)s * FX_SLOT_SIZE, hdr, 8);
+      uint8_t *hdr = songCache[r];
       arduboy.setCursor(21, y + 1);
       if (hdr[0] == EEPROM_MAGIC0 && hdr[1] == EEPROM_MAGIC1) {
         for (uint8_t i = 0; i < 6; i++) arduboy.print((char)hdr[i + 2]);
@@ -1267,6 +1277,7 @@ void handleSongsInput() {
         // Confirm name and save
         fxSaveSlot(songSlot, songEditName);
         songNaming = false;
+        refreshSongCache();
         resetInputState();
         return;
       }
@@ -1307,6 +1318,7 @@ void handleSongsInput() {
           memcpy(name6, hdr + 2, 6);
           name6[6] = '\0';
           fxSaveSlot(songSlot, name6);
+          refreshSongCache();
           resetInputState();
         } else {
           // Empty slot — build default name "SONG nn"
@@ -1355,11 +1367,11 @@ void handleSongsInput() {
     }
     if (checkRepeat(UP_BUTTON, 0) && songSlot > 0) {
       songSlot--;
-      if (songSlot < songScroll) songScroll = songSlot;
+      if (songSlot < songScroll) { songScroll = songSlot; refreshSongCache(); }
     }
     if (checkRepeat(DOWN_BUTTON, 1) && songSlot < SONG_SLOTS - 1) {
       songSlot++;
-      if (songSlot >= songScroll + SONGS_VIS) songScroll = songSlot - SONGS_VIS + 1;
+      if (songSlot >= songScroll + SONGS_VIS) { songScroll = songSlot - SONGS_VIS + 1; refreshSongCache(); }
     }
   }
 }
