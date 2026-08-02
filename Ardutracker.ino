@@ -10,7 +10,7 @@ static const uint8_t CELL_H     = 9;
 static const uint8_t DBL_WINDOW = 10;
 
 // ── Screen ────────────────────────────────────────────────────────────────────
-enum Screen : uint8_t { SCR_TRACKER, SCR_PATTERN, SCR_SETTINGS, SCR_SOUND };
+enum Screen : uint8_t { SCR_TRACKER, SCR_PATTERN, SCR_SETTINGS, SCR_SOUND, SCR_PRESET };
 Screen screen = SCR_TRACKER;
 
 // ── Shared input ──────────────────────────────────────────────────────────────
@@ -79,18 +79,25 @@ uint32_t tapTimes[4];
 uint8_t  tapHead = 0, tapFill = 0;
 
 // ── Sound / columns ───────────────────────────────────────────────────────────
-// 8 presets: 2-char name, octave offset relative to written note
+// 8 presets: 2-char name; editable oct offset + pulse width stored in presetOct/PW
 static const char  PRESET_NAME[8][3] PROGMEM = {
   "LD","BS","AP","CH","HI","LO","PC","PD"
 };
-static const int8_t PRESET_OCT[8] PROGMEM = { 0, -2, 0, 0, +1, -1, 0, 0 };
+// Factory defaults (restored by A-tap in preset editor)
+static const int8_t  DEF_PRESET_OCT[8] PROGMEM = {  0, -2,  0,  0, +1, -1,  0,  0 };
+static const uint8_t DEF_PRESET_PW[8]  PROGMEM = {  4,  4,  3,  5,  2,  4,  2,  6 };
+// PW 1-8: 1=12.5% (thin/bright), 4=50% (square), 8=~100% (fat)
 
-uint8_t colPreset[COLS] = {1, 4, 2, 3, 0, 5, 6, 7};  // col1=BS(oct-2 BD), col2=HI(oct+1 SN)
-uint8_t colVolume[COLS] = {8, 8, 8, 8, 8, 8, 8, 8};
+int8_t  presetOct[8];  // editable per-preset octave offset
+uint8_t presetPW[8];   // editable per-preset pulse width (1-8)
+uint8_t editPreset = 0, editParam = 0;  // preset editor state
+
+uint8_t colPreset[COLS] = {1, 4, 2, 3, 0, 5, 6, 7};  // col1=BS(BD), col2=HI(SN)
+uint8_t colMute[COLS]   = {0, 0, 0, 0, 0, 0, 0, 0};   // 0=active, 1=muted (speaker only)
 uint8_t colMidi[COLS]   = {1, 2, 3, 4, 5, 6, 7, 8};  // MIDI channel per column (1-16)
 uint8_t colMidiNote[COLS];  // currently sounding MIDI note per column; 0xFF=none
 
-uint8_t sndCurCol = 0, sndCurRow = 0;  // 0=preset, 1=volume, 2=midi ch
+uint8_t sndCurCol = 0, sndCurRow = 0;  // 0=preset, 1=mute, 2=midi ch
 
 // ── Playback ──────────────────────────────────────────────────────────────────
 bool     playing      = false;
@@ -109,16 +116,18 @@ static const uint32_t SAMPLE_RATE = 40000UL;
 
 volatile uint16_t voiceDelta[MAX_VOICES];
 volatile uint8_t  voiceActive[MAX_VOICES];
+volatile uint8_t  voicePW[MAX_VOICES];  // duty threshold 0-255 (128 = 50% square)
 uint8_t colVoice[COLS];  // 0xFF = no voice assigned
 
 ISR(TIMER3_COMPA_vect) {
   static uint16_t ph[MAX_VOICES];
   ph[0] += voiceDelta[0]; ph[1] += voiceDelta[1];
   ph[2] += voiceDelta[2]; ph[3] += voiceDelta[3];
-  uint8_t out = ((uint8_t)(ph[0] >> 15) & voiceActive[0])
-              ^ ((uint8_t)(ph[1] >> 15) & voiceActive[1])
-              ^ ((uint8_t)(ph[2] >> 15) & voiceActive[2])
-              ^ ((uint8_t)(ph[3] >> 15) & voiceActive[3]);
+  // Duty cycle: voice is "on" when high byte of phase < voicePW threshold
+  uint8_t out = (((uint8_t)(ph[0] >> 8) < voicePW[0]) & voiceActive[0])
+              ^ (((uint8_t)(ph[1] >> 8) < voicePW[1]) & voiceActive[1])
+              ^ (((uint8_t)(ph[2] >> 8) < voicePW[2]) & voiceActive[2])
+              ^ (((uint8_t)(ph[3] >> 8) < voicePW[3]) & voiceActive[3]);
   if (out) { PORTC = (PORTC | (1 << 6)) & ~(1 << 7); }
   else     { PORTC = (PORTC & ~(1 << 6)) | (1 << 7); }
 }
@@ -126,16 +135,18 @@ ISR(TIMER3_COMPA_vect) {
 void audioBegin() {
   DDRC  |=  (1 << 6) | (1 << 7);
   PORTC &= ~((1 << 6) | (1 << 7));
+  for (uint8_t v = 0; v < MAX_VOICES; v++) voicePW[v] = 128;  // default 50% duty
   TCCR3A = 0;
   TCCR3B = (1 << WGM32) | (1 << CS30);  // CTC, prescaler=1
   OCR3A  = (uint16_t)(F_CPU / SAMPLE_RATE) - 1;  // 399 at 40kHz
   // TIMSK3 stays 0; voiceOn() enables it when a note starts
 }
 
-void voiceOn(uint8_t v, uint16_t freq) {
+void voiceOn(uint8_t v, uint16_t freq, uint8_t pw) {
   uint16_t delta = (uint16_t)((uint32_t)freq * 65536UL / SAMPLE_RATE);
   cli();
   voiceDelta[v]  = delta;
+  voicePW[v]     = pw;
   voiceActive[v] = 1;
   TIMSK3         = (1 << OCIE3A);
   sei();
@@ -172,10 +183,11 @@ uint8_t findFreeVoice() {
 
 // ── EEPROM layout (base offset 16 to clear Arduboy2 reserved bytes) ───────────
 // [0-1] magic  [2-321] grid  [322-833] patNote
-// [834-835] bpm  [836-843] colPreset  [844-851] colVolume  [852-859] colMidi
+// [834-835] bpm  [836-843] colPreset  [844-851] colMute  [852-859] colMidi
+// [860-867] presetOct  [868-875] presetPW
 static const uint16_t EEPROM_BASE   = 16;
 static const uint8_t  EEPROM_MAGIC0 = 0xA7;
-static const uint8_t  EEPROM_MAGIC1 = 0x5D;  // bumped: added colMidi field
+static const uint8_t  EEPROM_MAGIC1 = 0x5E;  // bumped: mute+preset params
 
 // ── EEPROM save / load ────────────────────────────────────────────────────────
 void saveSong() {
@@ -195,8 +207,10 @@ void saveSong() {
   EEPROM.update(addr++, (uint8_t)(bpm & 0xFF));
   EEPROM.update(addr++, (uint8_t)(bpm >> 8));
   for (uint8_t i = 0; i < COLS; i++) EEPROM.update(addr++, colPreset[i]);
-  for (uint8_t i = 0; i < COLS; i++) EEPROM.update(addr++, colVolume[i]);
+  for (uint8_t i = 0; i < COLS; i++) EEPROM.update(addr++, colMute[i]);
   for (uint8_t i = 0; i < COLS; i++) EEPROM.update(addr++, colMidi[i]);
+  for (uint8_t i = 0; i < 8;    i++) EEPROM.update(addr++, (uint8_t)presetOct[i]);
+  for (uint8_t i = 0; i < 8;    i++) EEPROM.update(addr++, presetPW[i]);
 }
 
 void loadSong() {
@@ -210,8 +224,10 @@ void loadSong() {
   bpm = (uint16_t)EEPROM.read(addr) | ((uint16_t)EEPROM.read(addr + 1) << 8);
   addr += 2;
   for (uint8_t i = 0; i < COLS; i++) colPreset[i] = EEPROM.read(addr++);
-  for (uint8_t i = 0; i < COLS; i++) colVolume[i]  = EEPROM.read(addr++);
-  for (uint8_t i = 0; i < COLS; i++) colMidi[i]    = EEPROM.read(addr++);
+  for (uint8_t i = 0; i < COLS; i++) colMute[i]   = EEPROM.read(addr++);
+  for (uint8_t i = 0; i < COLS; i++) colMidi[i]   = EEPROM.read(addr++);
+  for (uint8_t i = 0; i < 8;    i++) presetOct[i] = (int8_t)EEPROM.read(addr++);
+  for (uint8_t i = 0; i < 8;    i++) presetPW[i]  = EEPROM.read(addr++);
 }
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
@@ -224,6 +240,10 @@ void setup() {
   memset(patNote, 0xFF, sizeof(patNote));
   memset(colVoice,    0xFF, sizeof(colVoice));
   memset(colMidiNote, 0xFF, sizeof(colMidiNote));
+  for (uint8_t i = 0; i < 8; i++) {
+    presetOct[i] = (int8_t)pgm_read_byte(&DEF_PRESET_OCT[i]);
+    presetPW[i]  = pgm_read_byte(&DEF_PRESET_PW[i]);
+  }
   loadSong();
   audioBegin();
 }
@@ -397,11 +417,12 @@ void drawSound() {
     arduboy.print((char)pgm_read_byte(&PRESET_NAME[colPreset[c]][1]));
   }
 
-  // Volume row
+  // Mute row
   for (uint8_t c = 0; c < COLS; c++) {
     uint8_t cx = c * CELL_W;
     uint8_t cy = CELL_H * 2;
     bool cur = (c == sndCurCol && sndCurRow == 1);
+    bool muted = (colMute[c] != 0);
     if (cur) {
       arduboy.fillRect(cx + 1, cy + 1, CELL_W - 2, CELL_H - 2, WHITE);
       arduboy.setTextColor(BLACK);
@@ -409,9 +430,7 @@ void drawSound() {
       arduboy.setTextColor(WHITE);
     }
     arduboy.setCursor(cx + 2, cy + 1);
-    uint8_t v = colVolume[c];
-    if (v < 10) arduboy.print(' ');
-    arduboy.print(v);
+    arduboy.print(muted ? F("--") : F("ON"));
   }
   // MIDI channel row
   for (uint8_t c = 0; c < COLS; c++) {
@@ -432,9 +451,9 @@ void drawSound() {
   arduboy.setTextColor(WHITE);
 
   arduboy.setCursor(2, CELL_H * 4 + 4);
-  arduboy.print(F("A:prs A+<>:vol/ch"));
+  arduboy.print(F("A:prs/mute A+<>:ch"));
   arduboy.setCursor(2, CELL_H * 4 + 13);
-  arduboy.print(F("B:back"));
+  arduboy.print(F("B:back  B+^:synths"));
 }
 
 // ── Tracker cell edit ─────────────────────────────────────────────────────────
@@ -555,20 +574,24 @@ void stepPlay() {
       if (colVoice[c] < MAX_VOICES)  { voiceOff(colVoice[c]); colVoice[c] = 0xFF; }
       if (colMidiNote[c] != 0xFF)    { midiNoteOff(colMidi[c], colMidiNote[c]); colMidiNote[c] = 0xFF; }
     } else if (n != NOTE_EMPTY) {
-      // Internal voice (octave-shifted for hardware speaker)
-      int8_t  oct = (int8_t)pgm_read_byte(&PRESET_OCT[colPreset[c]]);
-      int16_t adj = (int16_t)n + (int16_t)oct * 12;
-      if (adj < NOTE_MIN) adj = NOTE_MIN;
-      if (adj > NOTE_MAX) adj = NOTE_MAX;
-      uint16_t freq = midiToFreq((uint8_t)adj);
-      if (freq > 0) {
-        if (colVoice[c] >= MAX_VOICES) colVoice[c] = findFreeVoice();
-        if (colVoice[c] < MAX_VOICES)  voiceOn(colVoice[c], freq);
+      uint8_t preset = colPreset[c];
+      // Internal voice (octave-shifted, pulse-width from preset)
+      if (!colMute[c]) {
+        int8_t  oct = presetOct[preset];
+        int16_t adj = (int16_t)n + (int16_t)oct * 12;
+        if (adj < NOTE_MIN) adj = NOTE_MIN;
+        if (adj > NOTE_MAX) adj = NOTE_MAX;
+        uint16_t freq = midiToFreq((uint8_t)adj);
+        // pw 1-8 → threshold 31-255: (pw*32)-1
+        uint8_t pw = (uint8_t)((uint16_t)presetPW[preset] * 32 - 1);
+        if (freq > 0) {
+          if (colVoice[c] >= MAX_VOICES) colVoice[c] = findFreeVoice();
+          if (colVoice[c] < MAX_VOICES)  voiceOn(colVoice[c], freq, pw);
+        }
       }
-      // MIDI output — raw pattern note, no octave shift (DAW has its own mapping)
+      // MIDI output always sends regardless of mute (DAW controls its own volume)
       if (colMidiNote[c] != 0xFF) midiNoteOff(colMidi[c], colMidiNote[c]);
-      uint8_t vel = (uint8_t)((uint16_t)colVolume[c] * 127 / 10);
-      midiNoteOn(colMidi[c], n, vel);
+      midiNoteOn(colMidi[c], n, 100);
       colMidiNote[c] = n;
     }
     // NOTE_EMPTY: sustain — leave voice and MIDI note running
@@ -765,6 +788,17 @@ void handleSettingsInput() {
 
 // ── Input: Sound ──────────────────────────────────────────────────────────────
 void handleSoundInput() {
+  bool justRelA = arduboy.justReleased(A_BUTTON);
+  bool wasClean = aPressClean;
+
+  bool bHeld = arduboy.pressed(B_BUTTON);
+  if (bHeld && arduboy.justPressed(UP_BUTTON)) {
+    editPreset = colPreset[sndCurCol];
+    editParam  = 0;
+    resetInputState();
+    screen = SCR_PRESET;
+    return;
+  }
   if (arduboy.justPressed(B_BUTTON)) {
     resetInputState();
     screen = SCR_TRACKER;
@@ -778,21 +812,127 @@ void handleSoundInput() {
   if (aHeld != aWasPressed) { resetInputState(); aWasPressed = aHeld; }
 
   if (aHeld) {
-    if (noDir && arduboy.justPressed(A_BUTTON)) {
-      if (sndCurRow == 0)
-        colPreset[sndCurCol] = (colPreset[sndCurCol] + 1) & 7;
-    } else if (!noDir && sndCurRow == 1) {
-      if (checkRepeat(LEFT_BUTTON,  2) && colVolume[sndCurCol] > 0)  colVolume[sndCurCol]--;
-      if (checkRepeat(RIGHT_BUTTON, 3) && colVolume[sndCurCol] < 10) colVolume[sndCurCol]++;
+    if (arduboy.justPressed(A_BUTTON)) {
+      aPressClean = noDir;
     } else if (!noDir && sndCurRow == 2) {
+      aPressClean = false;
       if (checkRepeat(LEFT_BUTTON,  2) && colMidi[sndCurCol] > 1)   colMidi[sndCurCol]--;
       if (checkRepeat(RIGHT_BUTTON, 3) && colMidi[sndCurCol] < 16)  colMidi[sndCurCol]++;
     }
   } else {
+    if (justRelA && wasClean) {
+      if (sndCurRow == 0) colPreset[sndCurCol] = (colPreset[sndCurCol] + 1) & 7;
+      else if (sndCurRow == 1) colMute[sndCurCol] ^= 1;
+    }
     if (checkRepeat(UP_BUTTON,    0) && sndCurRow > 0)        sndCurRow--;
     if (checkRepeat(DOWN_BUTTON,  1) && sndCurRow < 2)        sndCurRow++;
     if (checkRepeat(LEFT_BUTTON,  2) && sndCurCol > 0)        sndCurCol--;
     if (checkRepeat(RIGHT_BUTTON, 3) && sndCurCol < COLS - 1) sndCurCol++;
+  }
+}
+
+// ── Draw: Preset Editor ───────────────────────────────────────────────────────
+void drawPreset() {
+  uint8_t p = editPreset;
+  const uint8_t SX = 26, SW = 72;  // slider start x, total width
+
+  arduboy.drawRect(0, 0, 128, 64, WHITE);
+  arduboy.drawFastHLine(0,  9, 128, WHITE);
+  arduboy.drawFastHLine(0, 18, 128, WHITE);
+  arduboy.drawFastHLine(0, 27, 128, WHITE);
+
+  // Header: preset number + name
+  arduboy.setTextColor(WHITE);
+  arduboy.setCursor(4, 1);
+  arduboy.print(F("P")); arduboy.print(p + 1); arduboy.print(':');
+  arduboy.print((char)pgm_read_byte(&PRESET_NAME[p][0]));
+  arduboy.print((char)pgm_read_byte(&PRESET_NAME[p][1]));
+  arduboy.setCursor(50, 1);
+  arduboy.print(F("<>:prst  A:reset"));
+
+  // OCT slider row (y=9)
+  bool octSel = (editParam == 0);
+  if (octSel) { arduboy.fillRect(1, 10, 126, 7, WHITE); arduboy.setTextColor(BLACK); }
+  arduboy.setCursor(3, 10);
+  arduboy.print(F("OCT"));
+  {
+    int8_t  oct    = presetOct[p];
+    uint8_t thumbX = (uint8_t)(SX + (uint16_t)(oct + 4) * SW / 8);
+    uint8_t ctrX   = SX + SW / 2;
+    uint8_t col    = octSel ? BLACK : WHITE;
+    arduboy.drawFastHLine(SX, 13, SW, col);
+    arduboy.drawFastVLine(ctrX, 12, 3, col);   // center tick
+    arduboy.fillRect(thumbX - 1, 11, 3, 5, col);  // thumb
+    arduboy.setCursor(102, 10);
+    if (oct >= 0) arduboy.print('+');
+    arduboy.print(oct);
+  }
+
+  // PW slider row (y=18)
+  arduboy.setTextColor(WHITE);
+  bool pwSel = (editParam == 1);
+  if (pwSel) { arduboy.fillRect(1, 19, 126, 7, WHITE); arduboy.setTextColor(BLACK); }
+  arduboy.setCursor(3, 19);
+  arduboy.print(F("PW "));
+  {
+    uint8_t pw     = presetPW[p];
+    uint8_t fill   = (uint8_t)((uint16_t)(pw - 1) * SW / 7);
+    uint8_t col    = pwSel ? BLACK : WHITE;
+    arduboy.drawFastHLine(SX, 22, SW, col);
+    if (fill > 0) arduboy.fillRect(SX, 20, fill, 5, col);
+    arduboy.drawFastVLine(SX + SW - 1, 21, 3, col);  // right-end tick
+    arduboy.setCursor(102, 19);
+    arduboy.print(pw);
+    arduboy.print(F("/8"));
+  }
+
+  arduboy.setTextColor(WHITE);
+  arduboy.setCursor(4, 30);
+  arduboy.print(F("ud:param  A+<>:change"));
+  arduboy.setCursor(4, 39);
+  arduboy.print(F("B:back  A:rst preset"));
+}
+
+// ── Input: Preset Editor ──────────────────────────────────────────────────────
+void handlePresetInput() {
+  bool justRelA = arduboy.justReleased(A_BUTTON);
+  bool wasClean = aPressClean;
+
+  if (arduboy.justPressed(B_BUTTON)) {
+    resetInputState();
+    screen = SCR_SOUND;
+    return;
+  }
+
+  bool aHeld = arduboy.pressed(A_BUTTON);
+  bool noDir = !arduboy.pressed(UP_BUTTON)   && !arduboy.pressed(DOWN_BUTTON) &&
+               !arduboy.pressed(LEFT_BUTTON) && !arduboy.pressed(RIGHT_BUTTON);
+
+  if (aHeld != aWasPressed) { resetInputState(); aWasPressed = aHeld; }
+
+  if (aHeld) {
+    if (arduboy.justPressed(A_BUTTON)) {
+      aPressClean = noDir;
+    } else if (!noDir) {
+      aPressClean = false;
+      if (editParam == 0) {
+        if (checkRepeat(LEFT_BUTTON,  2) && presetOct[editPreset] > -4) presetOct[editPreset]--;
+        if (checkRepeat(RIGHT_BUTTON, 3) && presetOct[editPreset] < +4) presetOct[editPreset]++;
+      } else {
+        if (checkRepeat(LEFT_BUTTON,  2) && presetPW[editPreset] > 1) presetPW[editPreset]--;
+        if (checkRepeat(RIGHT_BUTTON, 3) && presetPW[editPreset] < 8) presetPW[editPreset]++;
+      }
+    }
+  } else {
+    if (justRelA && wasClean) {
+      // Reset this preset to factory defaults
+      presetOct[editPreset] = (int8_t)pgm_read_byte(&DEF_PRESET_OCT[editPreset]);
+      presetPW[editPreset]  = pgm_read_byte(&DEF_PRESET_PW[editPreset]);
+    }
+    if (checkRepeat(UP_BUTTON,    0) && editParam > 0) editParam--;
+    if (checkRepeat(DOWN_BUTTON,  1) && editParam < 1) editParam++;
+    if (checkRepeat(LEFT_BUTTON,  2)) editPreset = (editPreset + 7) & 7;
+    if (checkRepeat(RIGHT_BUTTON, 3)) editPreset = (editPreset + 1) & 7;
   }
 }
 
@@ -809,6 +949,7 @@ void loop() {
       case SCR_PATTERN:  drawPattern();  break;
       case SCR_SETTINGS: drawSettings(); break;
       case SCR_SOUND:    drawSound();    break;
+      case SCR_PRESET:   drawPreset();   break;
     }
     arduboy.display();
     return;
@@ -836,6 +977,11 @@ void loop() {
       handleSoundInput();
       arduboy.clear();
       drawSound();
+      break;
+    case SCR_PRESET:
+      handlePresetInput();
+      arduboy.clear();
+      drawPreset();
       break;
   }
   arduboy.display();
