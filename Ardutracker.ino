@@ -1382,7 +1382,6 @@ void loop() {
   arduboy.pollButtons();
 
   if (handlePlayStop()) {
-    // Just redraw without running input handlers this frame
     arduboy.clear();
     switch (screen) {
       case SCR_TRACKER:  drawTracker();  break;
@@ -1398,37 +1397,25 @@ void loop() {
 
   if (playing) stepPlay();
 
+  // Input pass — handlers may change screen; draw pass re-reads screen after
   switch (screen) {
-    case SCR_TRACKER:
-      handleTrackerInput();
-      arduboy.clear();
-      drawTracker();
-      break;
-    case SCR_PATTERN:
-      handlePatternInput();
-      arduboy.clear();
-      drawPattern();
-      break;
-    case SCR_SETTINGS:
-      handleSettingsInput();
-      arduboy.clear();
-      drawSettings();
-      break;
-    case SCR_SOUND:
-      handleSoundInput();
-      arduboy.clear();
-      drawSound();
-      break;
-    case SCR_PRESET:
-      handlePresetInput();
-      arduboy.clear();
-      drawPreset();
-      break;
-    case SCR_SONGS:
-      handleSongsInput();
-      arduboy.clear();
-      drawSongs();
-      break;
+    case SCR_TRACKER:  handleTrackerInput();  break;
+    case SCR_PATTERN:  handlePatternInput();  break;
+    case SCR_SETTINGS: handleSettingsInput(); break;
+    case SCR_SOUND:    handleSoundInput();    break;
+    case SCR_PRESET:   handlePresetInput();   break;
+    case SCR_SONGS:    handleSongsInput();    break;
+  }
+
+  // Draw pass — always matches current screen so transitions are instant
+  arduboy.clear();
+  switch (screen) {
+    case SCR_TRACKER:  drawTracker();  break;
+    case SCR_PATTERN:  drawPattern();  break;
+    case SCR_SETTINGS: drawSettings(); break;
+    case SCR_SOUND:    drawSound();    break;
+    case SCR_PRESET:   drawPreset();   break;
+    case SCR_SONGS:    drawSongs();    break;
   }
   arduboy.display();
 }
