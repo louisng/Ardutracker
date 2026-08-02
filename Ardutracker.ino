@@ -1,14 +1,20 @@
 #include <Arduboy2.h>
+#include <ArduboyTones.h>
+#include <EEPROM.h>
 
 Arduboy2 arduboy;
+ArduboyTones sound(arduboy.audio.enabled);
 
-// ── Shared ────────────────────────────────────────────────────────────────────
-static const uint8_t CELL_H = 9;
+// ── Constants ─────────────────────────────────────────────────────────────────
+static const uint8_t CELL_H     = 9;
+static const uint8_t DBL_WINDOW = 10;
 
-enum Screen : uint8_t { SCR_TRACKER, SCR_PATTERN, SCR_SETTINGS };
+// ── Screen ────────────────────────────────────────────────────────────────────
+enum Screen : uint8_t { SCR_TRACKER, SCR_PATTERN, SCR_SETTINGS, SCR_SOUND };
 Screen screen = SCR_TRACKER;
 
-uint8_t rptTimer[4];  // UP=0 DOWN=1 LEFT=2 RIGHT=3
+// ── Shared input ──────────────────────────────────────────────────────────────
+uint8_t rptTimer[4];
 static const uint8_t RPT_START = 20;
 static const uint8_t RPT_RATE  = 5;
 bool aWasPressed = false;
@@ -29,7 +35,7 @@ void resetInputState() {
   aWasPressed = false;
 }
 
-// ── Tracker screen ────────────────────────────────────────────────────────────
+// ── Tracker ───────────────────────────────────────────────────────────────────
 static const uint8_t COLS     = 8;
 static const uint8_t ROWS     = 40;
 static const uint8_t VISIBLE  = 6;
@@ -38,17 +44,13 @@ static const uint8_t GRID_MAX = 0x1F;
 
 uint8_t grid[ROWS][COLS];
 uint8_t gridLastVal = 0x00;
-
 uint8_t curCol = 0, curRow = 0, scrollTop = 0;
 
-// Tracker double-tap detection
-static const uint8_t DBL_WINDOW = 10;
 uint8_t gridTapTimer  = 0;
 bool    gridTapActive = false;
-uint8_t gridTapRow    = 0;
-uint8_t gridTapCol    = 0;
+uint8_t gridTapRow    = 0, gridTapCol = 0;
 
-// ── Pattern screen ────────────────────────────────────────────────────────────
+// ── Pattern ───────────────────────────────────────────────────────────────────
 static const uint8_t MAX_PATS    = 32;
 static const uint8_t PAT_STEPS   = 16;
 static const uint8_t PAT_VISIBLE = 7;
@@ -59,26 +61,84 @@ static const uint8_t NOTE_MIN    = 12;
 static const uint8_t NOTE_MAX    = 107;
 
 uint8_t patNote[MAX_PATS][PAT_STEPS];
-
-uint8_t openPat     = 0;
-uint8_t patCurCol   = 0, patCurRow = 0, patScroll = 0;
+uint8_t openPat = 0, patCurCol = 0, patCurRow = 0, patScroll = 0;
 uint8_t patLastNote = 60;
 
-// Pattern tap / double-tap detection
 uint8_t aTapTimer  = 0;
 bool    aTapActive = false;
-uint8_t aTapPrev   = NOTE_EMPTY;
-uint8_t aTapRow    = 0;
-uint8_t aTapCol    = 0;
+uint8_t aTapPrev   = NOTE_EMPTY, aTapRow = 0, aTapCol = 0;
 
-// ── Settings screen ───────────────────────────────────────────────────────────
+// ── Settings ──────────────────────────────────────────────────────────────────
 static const uint16_t BPM_MIN = 20;
 static const uint16_t BPM_MAX = 300;
 uint16_t bpm = 80;
 
 uint32_t tapTimes[4];
-uint8_t  tapHead = 0;
-uint8_t  tapFill = 0;
+uint8_t  tapHead = 0, tapFill = 0;
+
+// ── Sound / columns ───────────────────────────────────────────────────────────
+// 8 presets: 2-char name, octave offset relative to written note
+static const char  PRESET_NAME[8][3] PROGMEM = {
+  "LD","BS","AP","CH","HI","LO","PC","PD"
+};
+static const int8_t PRESET_OCT[8] PROGMEM = { 0, -2, 0, 0, +1, -1, 0, 0 };
+
+uint8_t colPreset[COLS] = {0, 1, 2, 3, 4, 5, 6, 7};
+uint8_t colVolume[COLS] = {8, 8, 8, 8, 8, 8, 8, 8};
+
+uint8_t sndCurCol = 0, sndCurRow = 0;  // 0=preset row, 1=volume row
+
+// ── Playback ──────────────────────────────────────────────────────────────────
+bool     playing    = false;
+uint8_t  playRow    = 0, playStep = 0;
+uint32_t lastStepMs = 0;
+
+// C4-B4 frequencies (MIDI 60-71); octave-shift via bit shift
+static const uint16_t NOTE_FREQS[12] PROGMEM = {
+  262, 277, 294, 311, 330, 349, 370, 392, 415, 440, 466, 494
+};
+
+// ── EEPROM layout (base offset 16 to clear Arduboy2 reserved bytes) ───────────
+// [0-1] magic  [2-321] grid  [322-833] patNote
+// [834-835] bpm  [836-843] colPreset  [844-851] colVolume
+static const uint16_t EEPROM_BASE   = 16;
+static const uint8_t  EEPROM_MAGIC0 = 0xA7;
+static const uint8_t  EEPROM_MAGIC1 = 0x5C;
+
+// ── EEPROM save / load ────────────────────────────────────────────────────────
+void saveSong() {
+  arduboy.clear();
+  arduboy.setTextColor(WHITE);
+  arduboy.setCursor(28, 28);
+  arduboy.print(F("SAVING..."));
+  arduboy.display();
+
+  uint16_t addr = EEPROM_BASE;
+  EEPROM.update(addr++, EEPROM_MAGIC0);
+  EEPROM.update(addr++, EEPROM_MAGIC1);
+  uint8_t *p = (uint8_t *)grid;
+  for (uint16_t i = 0; i < sizeof(grid);    i++) EEPROM.update(addr++, p[i]);
+  p = (uint8_t *)patNote;
+  for (uint16_t i = 0; i < sizeof(patNote); i++) EEPROM.update(addr++, p[i]);
+  EEPROM.update(addr++, (uint8_t)(bpm & 0xFF));
+  EEPROM.update(addr++, (uint8_t)(bpm >> 8));
+  for (uint8_t i = 0; i < COLS; i++) EEPROM.update(addr++, colPreset[i]);
+  for (uint8_t i = 0; i < COLS; i++) EEPROM.update(addr++, colVolume[i]);
+}
+
+void loadSong() {
+  if (EEPROM.read(EEPROM_BASE)     != EEPROM_MAGIC0 ||
+      EEPROM.read(EEPROM_BASE + 1) != EEPROM_MAGIC1) return;
+  uint16_t addr = EEPROM_BASE + 2;
+  uint8_t *p = (uint8_t *)grid;
+  for (uint16_t i = 0; i < sizeof(grid);    i++) p[i] = EEPROM.read(addr++);
+  p = (uint8_t *)patNote;
+  for (uint16_t i = 0; i < sizeof(patNote); i++) p[i] = EEPROM.read(addr++);
+  bpm = (uint16_t)EEPROM.read(addr) | ((uint16_t)EEPROM.read(addr + 1) << 8);
+  addr += 2;
+  for (uint8_t i = 0; i < COLS; i++) colPreset[i] = EEPROM.read(addr++);
+  for (uint8_t i = 0; i < COLS; i++) colVolume[i]  = EEPROM.read(addr++);
+}
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
@@ -86,6 +146,7 @@ void setup() {
   arduboy.setFrameRate(30);
   memset(grid, 0xFF, sizeof(grid));
   memset(patNote, 0xFF, sizeof(patNote));
+  loadSong();
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -105,7 +166,16 @@ void printNote(uint8_t note) {
   arduboy.print((char)('0' + note / 12 - 1));
 }
 
-// ── Tracker draw ──────────────────────────────────────────────────────────────
+uint16_t midiToFreq(uint8_t note) {
+  uint8_t  sem    = note % 12;
+  int8_t   octave = (int8_t)(note / 12) - 5;  // relative to C4 block (60/12=5)
+  uint16_t freq   = pgm_read_word(&NOTE_FREQS[sem]);
+  if (octave > 0) { for (int8_t i = 0; i < octave;  i++) freq <<= 1; }
+  else            { for (int8_t i = octave; i < 0;   i++) freq >>= 1; }
+  return freq;
+}
+
+// ── Draw: Tracker ─────────────────────────────────────────────────────────────
 void drawTracker() {
   for (uint8_t c = 0; c < COLS; c++)
     arduboy.drawFastVLine(c * CELL_W, 0, 64, WHITE);
@@ -122,6 +192,7 @@ void drawTracker() {
   for (uint8_t vr = 0; vr < VISIBLE; vr++) {
     uint8_t dr = vr + scrollTop;
     if (dr >= ROWS) break;
+    bool playHere = playing && (dr == playRow);
     for (uint8_t c = 0; c < COLS; c++) {
       uint8_t cx = c * CELL_W;
       uint8_t cy = (vr + 1) * CELL_H;
@@ -129,18 +200,22 @@ void drawTracker() {
       if (cur) {
         arduboy.fillRect(cx + 1, cy + 1, CELL_W - 2, CELL_H - 2, WHITE);
         arduboy.setTextColor(BLACK);
+      } else if (playHere) {
+        // Subtle play-row marker: invert just the top 1px of the cell interior
+        arduboy.drawFastHLine(cx + 1, cy + 1, CELL_W - 2, WHITE);
+        arduboy.setTextColor(WHITE);
       } else {
         arduboy.setTextColor(WHITE);
       }
-      arduboy.setCursor(cx + 2, cy + 1);
+      arduboy.setCursor(cx + 2, cy + 2);  // +2 to clear the play marker line
       if (grid[dr][c] == 0xFF) arduboy.print(F("--"));
-      else printHex2(grid[dr][c]);
+      else                     printHex2(grid[dr][c]);
     }
   }
   arduboy.setTextColor(WHITE);
 }
 
-// ── Pattern draw ──────────────────────────────────────────────────────────────
+// ── Draw: Pattern ─────────────────────────────────────────────────────────────
 void drawPattern() {
   arduboy.drawFastVLine(0,   0, 64, WHITE);
   arduboy.drawFastVLine(64,  0, 64, WHITE);
@@ -151,6 +226,7 @@ void drawPattern() {
   for (uint8_t vr = 0; vr < PAT_VISIBLE; vr++) {
     uint8_t step = vr + patScroll;
     if (step >= PAT_STEPS) break;
+    bool playHere = playing && (step == playStep);
     for (uint8_t c = 0; c < 2; c++) {
       uint8_t cx = c * PAT_COL_W;
       uint8_t cy = vr * CELL_H;
@@ -158,10 +234,13 @@ void drawPattern() {
       if (cur) {
         arduboy.fillRect(cx + 1, cy + 1, PAT_COL_W - 2, CELL_H - 2, WHITE);
         arduboy.setTextColor(BLACK);
+      } else if (playHere) {
+        arduboy.drawFastHLine(cx + 1, cy + 1, PAT_COL_W - 2, WHITE);
+        arduboy.setTextColor(WHITE);
       } else {
         arduboy.setTextColor(WHITE);
       }
-      arduboy.setCursor(cx + 2, cy + 1);
+      arduboy.setCursor(cx + 2, cy + 2);
       if (c == 0) {
         uint8_t n = patNote[openPat][step];
         if      (n == NOTE_EMPTY) arduboy.print(F("---"));
@@ -175,7 +254,7 @@ void drawPattern() {
   arduboy.setTextColor(WHITE);
 }
 
-// ── Settings draw ─────────────────────────────────────────────────────────────
+// ── Draw: Settings ────────────────────────────────────────────────────────────
 void drawSettings() {
   arduboy.drawRect(0, 0, 128, 64, WHITE);
   arduboy.drawFastHLine(0, 10, 128, WHITE);
@@ -187,7 +266,6 @@ void drawSettings() {
   arduboy.setCursor(4, 20);
   arduboy.print(F("TEMPO"));
 
-  // BPM box (inverted)
   arduboy.fillRect(60, 18, 38, 11, WHITE);
   arduboy.setTextColor(BLACK);
   arduboy.setCursor(63, 20);
@@ -197,17 +275,70 @@ void drawSettings() {
   arduboy.setCursor(101, 20);
   arduboy.print(F("BPM"));
 
-  // Tap dot indicator: filled circles for stored taps
   for (uint8_t i = 0; i < 4; i++) {
     uint8_t x = 60 + i * 8;
-    if (i < tapFill)
-      arduboy.fillCircle(x, 38, 2, WHITE);
-    else
-      arduboy.drawCircle(x, 38, 2, WHITE);
+    if (i < tapFill) arduboy.fillCircle(x, 38, 2, WHITE);
+    else             arduboy.drawCircle(x, 38, 2, WHITE);
   }
 
   arduboy.setCursor(4, 50);
   arduboy.print(F("B:back  A:tap"));
+}
+
+// ── Draw: Sound ───────────────────────────────────────────────────────────────
+void drawSound() {
+  for (uint8_t c = 0; c < COLS; c++)
+    arduboy.drawFastVLine(c * CELL_W, 0, 64, WHITE);
+  arduboy.drawFastVLine(127, 0, 64, WHITE);
+  arduboy.drawFastHLine(0, 0,            128, WHITE);
+  arduboy.drawFastHLine(0, CELL_H,       128, WHITE);
+  arduboy.drawFastHLine(0, CELL_H * 2,   128, WHITE);
+  arduboy.drawFastHLine(0, CELL_H * 3,   128, WHITE);
+
+  arduboy.setTextColor(WHITE);
+  for (uint8_t c = 0; c < COLS; c++) {
+    arduboy.setCursor(c * CELL_W + 5, 1);
+    arduboy.print((char)('1' + c));
+  }
+
+  // Preset row
+  for (uint8_t c = 0; c < COLS; c++) {
+    uint8_t cx = c * CELL_W;
+    uint8_t cy = CELL_H;
+    bool cur = (c == sndCurCol && sndCurRow == 0);
+    if (cur) {
+      arduboy.fillRect(cx + 1, cy + 1, CELL_W - 2, CELL_H - 2, WHITE);
+      arduboy.setTextColor(BLACK);
+    } else {
+      arduboy.setTextColor(WHITE);
+    }
+    arduboy.setCursor(cx + 2, cy + 1);
+    arduboy.print((char)pgm_read_byte(&PRESET_NAME[colPreset[c]][0]));
+    arduboy.print((char)pgm_read_byte(&PRESET_NAME[colPreset[c]][1]));
+  }
+
+  // Volume row
+  for (uint8_t c = 0; c < COLS; c++) {
+    uint8_t cx = c * CELL_W;
+    uint8_t cy = CELL_H * 2;
+    bool cur = (c == sndCurCol && sndCurRow == 1);
+    if (cur) {
+      arduboy.fillRect(cx + 1, cy + 1, CELL_W - 2, CELL_H - 2, WHITE);
+      arduboy.setTextColor(BLACK);
+    } else {
+      arduboy.setTextColor(WHITE);
+    }
+    arduboy.setCursor(cx + 2, cy + 1);
+    uint8_t v = colVolume[c];
+    if (v < 10) arduboy.print(' ');
+    arduboy.print(v);
+  }
+  arduboy.setTextColor(WHITE);
+
+  arduboy.setCursor(2, CELL_H * 3 + 4);
+  arduboy.print(F("A:preset  A+<>:vol"));
+  arduboy.setCursor(2, CELL_H * 3 + 13);
+  arduboy.print(F("B:back"));
 }
 
 // ── Tracker cell edit ─────────────────────────────────────────────────────────
@@ -220,10 +351,6 @@ void editCell(int16_t delta) {
   gridLastVal = *v;
 }
 
-// ── Tracker double-tap handler ────────────────────────────────────────────────
-// Single tap on empty → paste gridLastVal.
-// Double tap on empty → clear back to 0xFF (undo paste).
-// Double tap on set   → clear to 0xFF.
 void handleGridTap() {
   uint8_t *v = &grid[curRow][curCol];
   bool doubleTap = gridTapActive && gridTapTimer > 0 &&
@@ -231,13 +358,13 @@ void handleGridTap() {
   if (doubleTap) {
     gridTapActive = false;
     gridTapTimer  = 0;
-    *v = 0xFF;  // clear on any double-tap
+    *v = 0xFF;
   } else {
     gridTapRow    = curRow;
     gridTapCol    = curCol;
     gridTapActive = true;
     gridTapTimer  = DBL_WINDOW;
-    if (*v == 0xFF) *v = gridLastVal;  // paste on blank
+    if (*v == 0xFF) *v = gridLastVal;
   }
 }
 
@@ -252,7 +379,6 @@ void editPatNote(int16_t delta) {
   patLastNote = *n;
 }
 
-// ── Pattern A-tap handler ─────────────────────────────────────────────────────
 void handleATap() {
   uint8_t *n = &patNote[openPat][patCurRow];
   bool doubleTap = aTapActive && aTapTimer > 0 &&
@@ -284,12 +410,10 @@ void doTapTempo() {
   tapTimes[tapHead] = now;
   tapHead = (tapHead + 1) & 3;
   if (tapFill < 4) tapFill++;
-
   if (tapFill >= 2) {
-    // span between oldest and newest stored tap
-    uint8_t oldest = (tapFill < 4) ? 0 : tapHead;
-    uint32_t span = now - tapTimes[oldest];
-    uint32_t avg  = span / (tapFill - 1);
+    uint8_t  oldest   = (tapFill < 4) ? 0 : tapHead;
+    uint32_t span     = now - tapTimes[oldest];
+    uint32_t avg      = span / (tapFill - 1);
     if (avg > 0) {
       uint32_t computed = 60000UL / avg;
       if (computed < BPM_MIN) computed = BPM_MIN;
@@ -299,7 +423,54 @@ void doTapTempo() {
   }
 }
 
-// ── Tracker input ─────────────────────────────────────────────────────────────
+// ── Playback engine ───────────────────────────────────────────────────────────
+void stepPlay() {
+  uint32_t now    = millis();
+  uint32_t stepMs = 60000UL / bpm / 4;  // 16th note
+  if (now - lastStepMs < stepMs) return;
+  lastStepMs += stepMs;
+
+  uint8_t noteToPlay = NOTE_EMPTY;
+  for (uint8_t c = 0; c < COLS; c++) {
+    uint8_t patIdx = grid[playRow][c];
+    if (patIdx == 0xFF || patIdx >= MAX_PATS) continue;
+    uint8_t n = patNote[patIdx][playStep];
+    if (n == NOTE_MUTE) { noteToPlay = NOTE_MUTE; break; }
+    if (n != NOTE_EMPTY && noteToPlay == NOTE_EMPTY) {
+      int8_t  oct      = (int8_t)pgm_read_byte(&PRESET_OCT[colPreset[c]]);
+      int16_t adjusted = (int16_t)n + (int16_t)oct * 12;
+      if (adjusted < NOTE_MIN) adjusted = NOTE_MIN;
+      if (adjusted > NOTE_MAX) adjusted = NOTE_MAX;
+      noteToPlay = (uint8_t)adjusted;
+    }
+  }
+
+  if (noteToPlay == NOTE_MUTE) {
+    sound.noTone();
+  } else if (noteToPlay != NOTE_EMPTY) {
+    uint16_t freq = midiToFreq(noteToPlay);
+    if (freq > 0) sound.tone(freq, (uint16_t)(stepMs >> 1));
+  }
+
+  if (++playStep >= PAT_STEPS) {
+    playStep = 0;
+    if (++playRow >= ROWS) playRow = 0;  // loop
+  }
+}
+
+// ── A+B play/stop (global, checked before screen dispatch) ────────────────────
+bool handlePlayStop() {
+  bool abFire = (arduboy.justPressed(A_BUTTON) && arduboy.pressed(B_BUTTON)) ||
+                (arduboy.justPressed(B_BUTTON) && arduboy.pressed(A_BUTTON));
+  if (!abFire) return false;
+  playing = !playing;
+  if (playing) { playRow = 0; playStep = 0; lastStepMs = millis(); }
+  else         { sound.noTone(); }
+  resetInputState();
+  return true;
+}
+
+// ── Input: Tracker ────────────────────────────────────────────────────────────
 void handleTrackerInput() {
   if (gridTapTimer > 0) gridTapTimer--;
 
@@ -322,7 +493,15 @@ void handleTrackerInput() {
       if (checkRepeat(RIGHT_BUTTON, 3)) editCell(+0x01);
     }
   } else if (bHeld) {
-    if (arduboy.justPressed(RIGHT_BUTTON)) {
+    if (arduboy.justPressed(UP_BUTTON)) {
+      sndCurCol = curCol;
+      sndCurRow = 0;
+      resetInputState();
+      screen = SCR_SOUND;
+    } else if (arduboy.justPressed(DOWN_BUTTON)) {
+      saveSong();
+      resetInputState();
+    } else if (arduboy.justPressed(RIGHT_BUTTON)) {
       uint8_t val = grid[curRow][curCol];
       if (val != 0xFF && val < MAX_PATS) {
         openPat     = val;
@@ -355,7 +534,7 @@ void handleTrackerInput() {
   }
 }
 
-// ── Pattern input ─────────────────────────────────────────────────────────────
+// ── Input: Pattern ────────────────────────────────────────────────────────────
 void handlePatternInput() {
   if (aTapTimer > 0) aTapTimer--;
 
@@ -401,7 +580,7 @@ void handlePatternInput() {
   }
 }
 
-// ── Settings input ────────────────────────────────────────────────────────────
+// ── Input: Settings ───────────────────────────────────────────────────────────
 void handleSettingsInput() {
   if (arduboy.justPressed(B_BUTTON)) {
     resetInputState();
@@ -427,10 +606,55 @@ void handleSettingsInput() {
   }
 }
 
+// ── Input: Sound ──────────────────────────────────────────────────────────────
+void handleSoundInput() {
+  if (arduboy.justPressed(B_BUTTON)) {
+    resetInputState();
+    screen = SCR_TRACKER;
+    return;
+  }
+
+  bool aHeld = arduboy.pressed(A_BUTTON);
+  bool noDir = !arduboy.pressed(UP_BUTTON)   && !arduboy.pressed(DOWN_BUTTON) &&
+               !arduboy.pressed(LEFT_BUTTON) && !arduboy.pressed(RIGHT_BUTTON);
+
+  if (aHeld != aWasPressed) { resetInputState(); aWasPressed = aHeld; }
+
+  if (aHeld) {
+    if (noDir && arduboy.justPressed(A_BUTTON)) {
+      if (sndCurRow == 0)
+        colPreset[sndCurCol] = (colPreset[sndCurCol] + 1) & 7;
+    } else if (!noDir && sndCurRow == 1) {
+      if (checkRepeat(LEFT_BUTTON,  2) && colVolume[sndCurCol] > 0)  colVolume[sndCurCol]--;
+      if (checkRepeat(RIGHT_BUTTON, 3) && colVolume[sndCurCol] < 10) colVolume[sndCurCol]++;
+    }
+  } else {
+    if (checkRepeat(UP_BUTTON,    0) && sndCurRow > 0)        sndCurRow--;
+    if (checkRepeat(DOWN_BUTTON,  1) && sndCurRow < 1)        sndCurRow++;
+    if (checkRepeat(LEFT_BUTTON,  2) && sndCurCol > 0)        sndCurCol--;
+    if (checkRepeat(RIGHT_BUTTON, 3) && sndCurCol < COLS - 1) sndCurCol++;
+  }
+}
+
 // ── Main loop ─────────────────────────────────────────────────────────────────
 void loop() {
   if (!arduboy.nextFrame()) return;
   arduboy.pollButtons();
+
+  if (handlePlayStop()) {
+    // Just redraw without running input handlers this frame
+    arduboy.clear();
+    switch (screen) {
+      case SCR_TRACKER:  drawTracker();  break;
+      case SCR_PATTERN:  drawPattern();  break;
+      case SCR_SETTINGS: drawSettings(); break;
+      case SCR_SOUND:    drawSound();    break;
+    }
+    arduboy.display();
+    return;
+  }
+
+  if (playing) stepPlay();
 
   switch (screen) {
     case SCR_TRACKER:
@@ -447,6 +671,11 @@ void loop() {
       handleSettingsInput();
       arduboy.clear();
       drawSettings();
+      break;
+    case SCR_SOUND:
+      handleSoundInput();
+      arduboy.clear();
+      drawSound();
       break;
   }
   arduboy.display();
