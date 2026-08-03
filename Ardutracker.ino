@@ -675,11 +675,23 @@ static void fxWren() {
 // Try each candidate CS pin and keep whichever returns a real Winbond
 // JEDEC ID (0xEF ...). Falls back to the first candidate with any
 // non-trivial (not all-0x00 / all-0xFF) response, else leaves the default.
+//
+// A SPI NOR flash chip left in deep power-down (opcode 0xB9) ignores every
+// command except "release power-down" (0xAB) -- and since the AVR resetting
+// doesn't reset the external flash chip, whatever ran on this cart before
+// our sketch could easily have left it asleep. Wake it on each candidate
+// pin before judging its response, else a real chip on the right pin still
+// looks silent.
 static void fxDetectCS() {
   static const FxCsSel candidates[3] = { FXCS_PD1, FXCS_PD2, FXCS_PE2 };
   int8_t fallback = -1;
   for (uint8_t i = 0; i < 3; i++) {
     fxCsSel = candidates[i];
+    fxSel();
+    SPI.transfer(0xAB);  // Release Power-down
+    fxDesel();
+    delayMicroseconds(50);  // tRES2 wake settle time
+
     uint8_t id0;
     fxSel();
     SPI.transfer(0x9F);
