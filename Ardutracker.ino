@@ -766,6 +766,16 @@ void fxSaveSlot(uint8_t slot, const char* name6) {
   fxWriteSmall(base + 866, (uint8_t*)presetOct,   8);
   fxWriteSmall(base + 874, presetPW,              8);
   fxWriteSmall(base + 882, presetWave,            8);
+
+  // Verify the write actually landed before reporting success
+  uint8_t check[8];
+  fxRead(base, check, 8);
+  bool ok = (check[0] == EEPROM_MAGIC0 && check[1] == EEPROM_MAGIC1);
+  arduboy.clear();
+  arduboy.setCursor(16, 28);
+  arduboy.print(ok ? F("SAVE OK") : F("SAVE FAILED"));
+  arduboy.display();
+  delay(600);
 }
 
 // ── Character helpers for slot naming ─────────────────────────────────────────
