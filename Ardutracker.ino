@@ -150,10 +150,21 @@ static const char    WAVE_NAMES[4][3]    PROGMEM = { "SQ","TR","SA","NO" };
 static const uint8_t DEF_PRESET_WAVE[8] PROGMEM = {  0,   0,   0,   1,   3,   0,   3,   1  };
 // LD=SQ, BS=SQ, AP=SQ, CH=TR, HI=NO, LO=SQ, PC=NO, PD=TR
 
+// Gate (ring duration): how long a triggered note holds before auto-cutoff,
+// independent of mute. 0-3 = that many quarter notes (4 steps each, 16
+// steps/pattern); 4 = sustain forever (original always-on behavior, still
+// the default so nothing changes unless explicitly set).
+static const char    GATE_NAMES[5][3] PROGMEM = { "1Q","2Q","3Q","4Q","SU" };
+static const uint8_t GATE_STEPS[4]    PROGMEM = { 4, 8, 12, 16 };
+static const uint8_t GATE_SUSTAIN     = 4;
+static const uint8_t DEF_PRESET_GATE[8] PROGMEM = { GATE_SUSTAIN, GATE_SUSTAIN, GATE_SUSTAIN, GATE_SUSTAIN,
+                                                     GATE_SUSTAIN, GATE_SUSTAIN, GATE_SUSTAIN, GATE_SUSTAIN };
+
 int8_t  presetOct[8];   // editable per-preset octave offset
 uint8_t presetPW[8];    // editable per-preset pulse width (1-8)
 uint8_t presetWave[8];  // editable per-preset waveform (0-3)
-uint8_t editPreset = 0, editParam = 0;  // preset editor state (editParam: 0=OCT,1=PW,2=WAVE)
+uint8_t presetGate[8];  // editable per-preset gate length (0-3=quarter notes, 4=sustain)
+uint8_t editPreset = 0, editParam = 0;  // preset editor state (editParam: 0=OCT,1=PW,2=WAVE,3=GATE)
 
 uint8_t colPreset[COLS] = {1, 4, 2, 3, 0, 5, 6, 7};  // col1=BS(BD), col2=HI(SN)
 uint8_t colMute[COLS]   = {0, 0, 0, 0, 0, 0, 0, 0};   // 0=active, 1=muted (speaker only)
@@ -167,7 +178,7 @@ uint8_t sndCurCol = 0, sndCurRow = 0;  // 0=preset, 1=mute, 2=midi ch
 // Slot layout: [0-1] magic  [2-7] name(6)  [8-327] grid  [328-839] patNote
 //              [840-841] bpm  [842-849] colPreset  [850-857] colMute
 //              [858-865] colMidi  [866-873] presetOct  [874-881] presetPW
-//              [882-889] presetWave   total 890 bytes, rest 0xFF
+//              [882-889] presetWave  [890-897] presetGate   total 898 bytes, rest 0xFF
 static const uint32_t FX_SONG_BASE  = 0xFE0000UL;  // base address
 static const uint32_t FX_SLOT_SIZE  = 0x1000UL;    // 4096 bytes per slot (1 erase sector)
 static const uint8_t  SONG_SLOTS    = 32;
@@ -202,6 +213,7 @@ volatile uint8_t  voicePW[MAX_VOICES];    // duty threshold 0-255 (128 = 50% squ
 volatile uint8_t  voiceWave[MAX_VOICES];  // 0=square, 1=triangle, 2=sawtooth, 3=noise
 volatile int16_t  voiceErr[MAX_VOICES];   // PDM error accumulators for TR/SA
 uint8_t colVoice[COLS];  // 0xFF = no voice assigned
+uint8_t colGateSteps[COLS];  // steps remaining before auto-off; 0xFF = sustain (no timeout)
 
 ISR(TIMER3_COMPA_vect) {
   static uint16_t ph[MAX_VOICES];
@@ -293,10 +305,10 @@ uint8_t findFreeVoice() {
 // ── EEPROM layout (base offset 16 to clear Arduboy2 reserved bytes) ───────────
 // [0-1] magic  [2-321] grid  [322-833] patNote
 // [834-835] bpm  [836-843] colPreset  [844-851] colMute  [852-859] colMidi
-// [860-867] presetOct  [868-875] presetPW  [876-883] presetWave
+// [860-867] presetOct  [868-875] presetPW  [876-883] presetWave  [884-891] presetGate
 static const uint16_t EEPROM_BASE   = 16;
 static const uint8_t  EEPROM_MAGIC0 = 0xA7;
-static const uint8_t  EEPROM_MAGIC1 = 0x5F;  // bumped: added waveform per preset
+static const uint8_t  EEPROM_MAGIC1 = 0x60;  // bumped: added gate length per preset
 
 // ── EEPROM save / load ────────────────────────────────────────────────────────
 void saveSong() {
@@ -321,6 +333,7 @@ void saveSong() {
   for (uint8_t i = 0; i < 8;    i++) EEPROM.update(addr++, (uint8_t)presetOct[i]);
   for (uint8_t i = 0; i < 8;    i++) EEPROM.update(addr++, presetPW[i]);
   for (uint8_t i = 0; i < 8;    i++) EEPROM.update(addr++, presetWave[i]);
+  for (uint8_t i = 0; i < 8;    i++) EEPROM.update(addr++, presetGate[i]);
 }
 
 void loadSong() {
@@ -339,6 +352,7 @@ void loadSong() {
   for (uint8_t i = 0; i < 8;    i++) presetOct[i]  = (int8_t)EEPROM.read(addr++);
   for (uint8_t i = 0; i < 8;    i++) presetPW[i]   = EEPROM.read(addr++);
   for (uint8_t i = 0; i < 8;    i++) presetWave[i] = EEPROM.read(addr++);
+  for (uint8_t i = 0; i < 8;    i++) presetGate[i] = EEPROM.read(addr++);
 }
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
@@ -349,12 +363,14 @@ void setup() {
   arduboy.setFrameRate(30);
   memset(grid, 0xFF, sizeof(grid));
   memset(patNote, 0xFF, sizeof(patNote));
-  memset(colVoice,    0xFF, sizeof(colVoice));
+  memset(colVoice,     0xFF, sizeof(colVoice));
+  memset(colGateSteps, 0xFF, sizeof(colGateSteps));
   memset(colMidiNote, 0xFF, sizeof(colMidiNote));
   for (uint8_t i = 0; i < 8; i++) {
     presetOct[i]  = (int8_t)pgm_read_byte(&DEF_PRESET_OCT[i]);
     presetPW[i]   = pgm_read_byte(&DEF_PRESET_PW[i]);
     presetWave[i] = pgm_read_byte(&DEF_PRESET_WAVE[i]);
+    presetGate[i] = pgm_read_byte(&DEF_PRESET_GATE[i]);
   }
   loadSong();
   audioBegin();
@@ -910,6 +926,7 @@ void fxLoadSlot(uint8_t slot) {
   fxRead(base + 866, (uint8_t*)presetOct,   8);
   fxRead(base + 874, presetPW,              8);
   fxRead(base + 882, presetWave,            8);
+  fxRead(base + 890, presetGate,            8);
 }
 
 void fxSaveSlot(uint8_t slot, const char* name6) {
@@ -937,7 +954,7 @@ void fxSaveSlot(uint8_t slot, const char* name6) {
   fxWriteSmall(base + 512, (uint8_t*)patNote + 184, 128);
   fxWriteSmall(base + 640, (uint8_t*)patNote + 312, 128);
 
-  // Page 3 (bytes 768-1023): patNote[440..511](72) + misc fields(50)
+  // Page 3 (bytes 768-1023): patNote[440..511](72) + misc fields(58)
   fxWriteSmall(base + 768, (uint8_t*)patNote + 440, 72);
   uint8_t bpmBytes[2] = { (uint8_t)(bpm & 0xFF), (uint8_t)(bpm >> 8) };
   fxWriteSmall(base + 840, bpmBytes,              2);
@@ -947,6 +964,7 @@ void fxSaveSlot(uint8_t slot, const char* name6) {
   fxWriteSmall(base + 866, (uint8_t*)presetOct,   8);
   fxWriteSmall(base + 874, presetPW,              8);
   fxWriteSmall(base + 882, presetWave,            8);
+  fxWriteSmall(base + 890, presetGate,            8);
 
   // Verify the write actually landed before reporting success
   uint8_t check[8];
@@ -981,6 +999,18 @@ void stepPlay() {
   if (now - lastStepMs < stepMs) return;
   lastStepMs += stepMs;
 
+  // Gate countdown: cut any ringing voice whose preset has a finite gate
+  // length, independent of mute/pattern content this step.
+  for (uint8_t c = 0; c < COLS; c++) {
+    if (colGateSteps[c] != 0xFF) {
+      if (colGateSteps[c] > 0) colGateSteps[c]--;
+      if (colGateSteps[c] == 0 && colVoice[c] < MAX_VOICES) {
+        voiceOff(colVoice[c]);
+        colVoice[c] = 0xFF;
+      }
+    }
+  }
+
   for (uint8_t c = 0; c < COLS; c++) {
     uint8_t patIdx = grid[playRow][c];
     if (patIdx == 0xFF || patIdx >= MAX_PATS) continue;
@@ -988,8 +1018,11 @@ void stepPlay() {
     if (n == NOTE_MUTE) {
       if (colVoice[c] < MAX_VOICES)  { voiceOff(colVoice[c]); colVoice[c] = 0xFF; }
       if (colMidiNote[c] != 0xFF)    { midiNoteOff(colMidi[c], colMidiNote[c]); colMidiNote[c] = 0xFF; }
+      colGateSteps[c] = 0xFF;
     } else if (n != NOTE_EMPTY) {
       uint8_t preset = colPreset[c];
+      uint8_t gate   = presetGate[preset];
+      colGateSteps[c] = (gate == GATE_SUSTAIN) ? 0xFF : pgm_read_byte(&GATE_STEPS[gate]);
       // Internal voice (octave-shifted, pulse-width from preset)
       if (!colMute[c]) {
         int8_t  oct = presetOct[preset];
@@ -1038,11 +1071,13 @@ bool handlePlayStop() {
     playRow      = curRow;
     playStep     = 0;
     lastStepMs   = millis();
-    memset(colVoice, 0xFF, sizeof(colVoice));
+    memset(colVoice,     0xFF, sizeof(colVoice));
+    memset(colGateSteps, 0xFF, sizeof(colGateSteps));
   } else {
     allVoicesOff();
     allMidiOff();
-    memset(colVoice, 0xFF, sizeof(colVoice));
+    memset(colVoice,     0xFF, sizeof(colVoice));
+    memset(colGateSteps, 0xFF, sizeof(colGateSteps));
   }
   resetInputState();
   return true;
@@ -1085,7 +1120,7 @@ void handleTrackerInput() {
       resetInputState();
       screen = SCR_SOUND;
     } else if (arduboy.justPressed(DOWN_BUTTON)) {
-      if (playing) { allVoicesOff(); allMidiOff(); playing = false; memset(colVoice, 0xFF, sizeof(colVoice)); }
+      if (playing) { allVoicesOff(); allMidiOff(); playing = false; memset(colVoice, 0xFF, sizeof(colVoice)); memset(colGateSteps, 0xFF, sizeof(colGateSteps)); }
       songSlot   = 0;
       songScroll = 0;
       songNaming = false;
@@ -1258,12 +1293,11 @@ void drawPreset() {
 
   uint8_t p = editPreset;
   const uint8_t SX = 26, SW = 72;  // slider start x, total width
+  // Row separators: header(0-8), OCT(9-16), PW(17-24), WAVE(25-32), GATE(33-40)
+  static const uint8_t ROW_SEP[5] = { 9, 17, 25, 33, 41 };
 
   arduboy.drawRect(0, 0, 128, 64, WHITE);
-  arduboy.drawFastHLine(0,  9, 128, WHITE);
-  arduboy.drawFastHLine(0, 18, 128, WHITE);
-  arduboy.drawFastHLine(0, 27, 128, WHITE);
-  arduboy.drawFastHLine(0, 36, 128, WHITE);
+  for (uint8_t i = 0; i < 5; i++) arduboy.drawFastHLine(0, ROW_SEP[i], 128, WHITE);
 
   // Header: preset number + name
   arduboy.setTextColor(WHITE);
@@ -1276,7 +1310,7 @@ void drawPreset() {
 
   // OCT slider row (y=9)
   bool octSel = (editParam == 0);
-  if (octSel) { arduboy.fillRect(1, 10, 126, 7, WHITE); arduboy.setTextColor(BLACK); }
+  if (octSel) { arduboy.fillRect(1, 10, 126, 6, WHITE); arduboy.setTextColor(BLACK); }
   arduboy.setCursor(3, 10);
   arduboy.print(F("OCT"));
   {
@@ -1285,36 +1319,36 @@ void drawPreset() {
     uint8_t ctrX   = SX + SW / 2;
     uint8_t col    = octSel ? BLACK : WHITE;
     arduboy.drawFastHLine(SX, 13, SW, col);
-    arduboy.drawFastVLine(ctrX, 12, 3, col);
-    arduboy.fillRect(thumbX - 1, 11, 3, 5, col);
+    arduboy.drawFastVLine(ctrX, 12, 2, col);
+    arduboy.fillRect(thumbX - 1, 11, 3, 4, col);
     arduboy.setCursor(102, 10);
     if (oct >= 0) arduboy.print('+');
     arduboy.print(oct);
   }
 
-  // PW slider row (y=18)
+  // PW slider row (y=17)
   arduboy.setTextColor(WHITE);
   bool pwSel = (editParam == 1);
-  if (pwSel) { arduboy.fillRect(1, 19, 126, 7, WHITE); arduboy.setTextColor(BLACK); }
-  arduboy.setCursor(3, 19);
+  if (pwSel) { arduboy.fillRect(1, 18, 126, 6, WHITE); arduboy.setTextColor(BLACK); }
+  arduboy.setCursor(3, 18);
   arduboy.print(F("PW "));
   {
     uint8_t pw   = presetPW[p];
     uint8_t fill = (uint8_t)((uint16_t)(pw - 1) * SW / 7);
     uint8_t col  = pwSel ? BLACK : WHITE;
-    arduboy.drawFastHLine(SX, 22, SW, col);
-    if (fill > 0) arduboy.fillRect(SX, 20, fill, 5, col);
-    arduboy.drawFastVLine(SX + SW - 1, 21, 3, col);
-    arduboy.setCursor(102, 19);
+    arduboy.drawFastHLine(SX, 21, SW, col);
+    if (fill > 0) arduboy.fillRect(SX, 19, fill, 4, col);
+    arduboy.drawFastVLine(SX + SW - 1, 20, 2, col);
+    arduboy.setCursor(102, 18);
     arduboy.print(pw);
     arduboy.print(F("/8"));
   }
 
-  // WAVE selector row (y=27) — 4 options: SQ TR SA NO
+  // WAVE selector row (y=25) — 4 options: SQ TR SA NO
   arduboy.setTextColor(WHITE);
   bool waveSel = (editParam == 2);
-  if (waveSel) { arduboy.fillRect(1, 28, 126, 7, WHITE); arduboy.setTextColor(BLACK); }
-  arduboy.setCursor(3, 28);
+  if (waveSel) { arduboy.fillRect(1, 26, 126, 6, WHITE); arduboy.setTextColor(BLACK); }
+  arduboy.setCursor(3, 26);
   arduboy.print(F("WV"));
   {
     uint8_t selWv = presetWave[p];
@@ -1324,21 +1358,46 @@ void drawPreset() {
       if (cur) {
         uint8_t bc = waveSel ? BLACK : WHITE;
         uint8_t tc = waveSel ? WHITE : BLACK;
-        arduboy.fillRect(wx - 1, 28, 14, 7, bc);
+        arduboy.fillRect(wx - 1, 26, 14, 6, bc);
         arduboy.setTextColor(tc);
       } else {
         arduboy.setTextColor(waveSel ? BLACK : WHITE);
       }
-      arduboy.setCursor(wx, 28);
+      arduboy.setCursor(wx, 26);
       arduboy.print((char)pgm_read_byte(&WAVE_NAMES[i][0]));
       arduboy.print((char)pgm_read_byte(&WAVE_NAMES[i][1]));
     }
   }
 
+  // GATE selector row (y=33) — 5 options: 1Q 2Q 3Q 4Q SU
   arduboy.setTextColor(WHITE);
-  arduboy.setCursor(4, 38);
+  bool gateSel = (editParam == 3);
+  if (gateSel) { arduboy.fillRect(1, 34, 126, 6, WHITE); arduboy.setTextColor(BLACK); }
+  arduboy.setCursor(3, 34);
+  arduboy.print(F("LN"));
+  {
+    uint8_t selGate = presetGate[p];
+    for (uint8_t i = 0; i < 5; i++) {
+      uint8_t gx = 24 + i * 20;
+      bool cur = (selGate == i);
+      if (cur) {
+        uint8_t bc = gateSel ? BLACK : WHITE;
+        uint8_t tc = gateSel ? WHITE : BLACK;
+        arduboy.fillRect(gx - 1, 34, 14, 6, bc);
+        arduboy.setTextColor(tc);
+      } else {
+        arduboy.setTextColor(gateSel ? BLACK : WHITE);
+      }
+      arduboy.setCursor(gx, 34);
+      arduboy.print((char)pgm_read_byte(&GATE_NAMES[i][0]));
+      arduboy.print((char)pgm_read_byte(&GATE_NAMES[i][1]));
+    }
+  }
+
+  arduboy.setTextColor(WHITE);
+  arduboy.setCursor(4, 44);
   arduboy.print(F("ud:param  A+<>:edit"));
-  arduboy.setCursor(4, 47);
+  arduboy.setCursor(4, 53);
   arduboy.print(F("B:back  A:rst prst"));
 }
 
@@ -1370,9 +1429,12 @@ void handlePresetInput() {
       } else if (editParam == 1) {
         if (checkRepeat(LEFT_BUTTON,  2) && presetPW[editPreset] > 1) presetPW[editPreset]--;
         if (checkRepeat(RIGHT_BUTTON, 3) && presetPW[editPreset] < 8) presetPW[editPreset]++;
-      } else {
+      } else if (editParam == 2) {
         if (checkRepeat(LEFT_BUTTON,  2) && presetWave[editPreset] > 0) presetWave[editPreset]--;
         if (checkRepeat(RIGHT_BUTTON, 3) && presetWave[editPreset] < 3) presetWave[editPreset]++;
+      } else {
+        if (checkRepeat(LEFT_BUTTON,  2) && presetGate[editPreset] > 0) presetGate[editPreset]--;
+        if (checkRepeat(RIGHT_BUTTON, 3) && presetGate[editPreset] < GATE_SUSTAIN) presetGate[editPreset]++;
       }
     }
   } else {
@@ -1381,9 +1443,10 @@ void handlePresetInput() {
       presetOct[editPreset]  = (int8_t)pgm_read_byte(&DEF_PRESET_OCT[editPreset]);
       presetPW[editPreset]   = pgm_read_byte(&DEF_PRESET_PW[editPreset]);
       presetWave[editPreset] = pgm_read_byte(&DEF_PRESET_WAVE[editPreset]);
+      presetGate[editPreset] = pgm_read_byte(&DEF_PRESET_GATE[editPreset]);
     }
     if (checkRepeat(UP_BUTTON,    0) && editParam > 0) editParam--;
-    if (checkRepeat(DOWN_BUTTON,  1) && editParam < 2) editParam++;
+    if (checkRepeat(DOWN_BUTTON,  1) && editParam < 3) editParam++;
     if (checkRepeat(LEFT_BUTTON,  2)) editPreset = (editPreset + 7) & 7;
     if (checkRepeat(RIGHT_BUTTON, 3)) editPreset = (editPreset + 1) & 7;
   }
@@ -1561,8 +1624,9 @@ void handleSongsInput() {
       if (fxSlotValid(songSlot)) {
         fxLoadSlot(songSlot);
         allVoicesOff();
-        memset(colVoice,    0xFF, sizeof(colVoice));
-        memset(colMidiNote, 0xFF, sizeof(colMidiNote));
+        memset(colVoice,     0xFF, sizeof(colVoice));
+        memset(colGateSteps, 0xFF, sizeof(colGateSteps));
+        memset(colMidiNote,  0xFF, sizeof(colMidiNote));
         resetInputState();
         screen = SCR_TRACKER;
       }
