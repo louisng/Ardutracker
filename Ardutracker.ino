@@ -399,11 +399,6 @@ void drawTracker() {
                  hasPat ? F("PATTERN") : nullptr);
     return;
   }
-  if (heldAlone(A_BUTTON, B_BUTTON)) {
-    drawHeldHint(F("A HELD"), F("+10"), F("-10"), F("-1"), F("+1"));
-    return;
-  }
-
   for (uint8_t c = 0; c < COLS; c++)
     arduboy.drawFastVLine(c * CELL_W, 0, 64, WHITE);
   arduboy.drawFastVLine(127, 0, 64, WHITE);
@@ -444,11 +439,6 @@ void drawTracker() {
 
 // ── Draw: Pattern ─────────────────────────────────────────────────────────────
 void drawPattern() {
-  if (patCurCol == 0 && heldAlone(A_BUTTON, B_BUTTON)) {
-    drawHeldHint(F("A HELD"), F("+OCT"), F("-OCT"), F("-1"), F("+1"));
-    return;
-  }
-
   arduboy.drawFastVLine(0,   0, 64, WHITE);
   arduboy.drawFastVLine(64,  0, 64, WHITE);
   arduboy.drawFastVLine(127, 0, 64, WHITE);
@@ -495,10 +485,6 @@ void drawPattern() {
 
 // ── Draw: Settings ────────────────────────────────────────────────────────────
 void drawSettings() {
-  if (heldAlone(A_BUTTON, B_BUTTON)) {
-    drawHeldHint(F("A HELD"), F("+10 BPM"), F("-10 BPM"), F("-1 BPM"), F("+1 BPM"));
-    return;
-  }
 
   arduboy.drawRect(0, 0, 128, 64, WHITE);
   arduboy.drawFastHLine(0, 10, 128, WHITE);
@@ -535,11 +521,6 @@ void drawSound() {
     drawHeldHint(F("B HELD"), F("PRESETS"), nullptr, nullptr, nullptr);
     return;
   }
-  if (sndCurRow == 2 && heldAlone(A_BUTTON, B_BUTTON)) {
-    drawHeldHint(F("A HELD"), nullptr, nullptr, F("-1 CH"), F("+1 CH"));
-    return;
-  }
-
   for (uint8_t c = 0; c < COLS; c++)
     arduboy.drawFastVLine(c * CELL_W, 0, 64, WHITE);
   arduboy.drawFastVLine(127, 0, 64, WHITE);
@@ -1274,12 +1255,6 @@ void handleSoundInput() {
 
 // ── Draw: Preset Editor ───────────────────────────────────────────────────────
 void drawPreset() {
-  if (heldAlone(A_BUTTON, B_BUTTON)) {
-    if (editParam == 0)      drawHeldHint(F("A HELD"), nullptr, nullptr, F("-1 OCT"), F("+1 OCT"));
-    else if (editParam == 1) drawHeldHint(F("A HELD"), nullptr, nullptr, F("-1 PW"),  F("+1 PW"));
-    else                     drawHeldHint(F("A HELD"), nullptr, nullptr, F("PREV WAVE"), F("NEXT WAVE"));
-    return;
-  }
 
   uint8_t p = editPreset;
   const uint8_t SX = 26, SW = 72;  // slider start x, total width
