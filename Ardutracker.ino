@@ -20,6 +20,9 @@ static const uint8_t RPT_START = 20;
 static const uint8_t RPT_RATE  = 5;
 bool aWasPressed  = false;
 bool aPressClean  = false;  // A was pressed without direction; fire tap on release
+uint8_t bHoldTimer = 0;
+bool    bHeldLong  = false;
+static const uint8_t B_TAP_WINDOW = 10;  // frames B can be held and still count as a tap
 
 bool checkRepeat(uint8_t btn, uint8_t idx) {
   if (arduboy.justPressed(btn)) { rptTimer[idx] = RPT_START; return true; }
@@ -36,6 +39,29 @@ void resetInputState() {
   memset(rptTimer, 0, sizeof(rptTimer));
   aWasPressed = false;
   aPressClean = false;
+  bHoldTimer  = 0;
+  bHeldLong   = false;
+}
+
+// For screens where B is both "tap alone to go back" and a hold-for-hint
+// modifier: call once per frame. Releasing within B_TAP_WINDOW frames (with
+// no direction ever pressed) fires the tap action; holding past that window
+// long enough to see the hint cancels it instead, even on release.
+bool bTapReleased() {
+  bool bHeld = arduboy.pressed(B_BUTTON);
+  bool noDir = !arduboy.pressed(UP_BUTTON)   && !arduboy.pressed(DOWN_BUTTON) &&
+               !arduboy.pressed(LEFT_BUTTON) && !arduboy.pressed(RIGHT_BUTTON);
+  if (bHeld) {
+    if (noDir) {
+      if (bHoldTimer < B_TAP_WINDOW) bHoldTimer++;
+      else bHeldLong = true;
+    }
+    return false;
+  }
+  bool fire = arduboy.justReleased(B_BUTTON) && !bHeldLong;
+  bHoldTimer = 0;
+  bHeldLong  = false;
+  return fire;
 }
 
 // True while `btn` is held alone: no direction pressed yet, and the other
@@ -1214,7 +1240,7 @@ void handleSoundInput() {
     screen = SCR_PRESET;
     return;
   }
-  if (arduboy.justPressed(B_BUTTON)) {
+  if (bTapReleased()) {
     resetInputState();
     screen = SCR_TRACKER;
     return;
