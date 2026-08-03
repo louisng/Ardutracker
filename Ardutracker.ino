@@ -623,8 +623,14 @@ void allMidiOff() {
 }
 
 // ── FX Flash driver ───────────────────────────────────────────────────────────
-static inline void fxSel()   { PORTE &= ~(1 << 6); }
-static inline void fxDesel() { PORTE |=  (1 << 6); }
+// Arduboy2 core asserts the OLED CS (PD6) once at boot and never releases it,
+// since stock Arduboy has no other SPI device. On FX boards the flash chip
+// shares the bus, so we must explicitly deselect the OLED while the flash is
+// selected — otherwise the display latches our flash opcodes as its own
+// command/data stream (e.g. 0x40-0x7F reads as "set display start line"),
+// which is what produces the endless shifting/scrolling look.
+static inline void fxSel()   { PORTD |=  (1 << 6); PORTE &= ~(1 << 6); }
+static inline void fxDesel() { PORTE |=  (1 << 6); PORTD &= ~(1 << 6); }
 
 static void fxWaitBusy() {
   fxSel();
