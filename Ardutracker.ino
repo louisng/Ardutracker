@@ -133,6 +133,12 @@ uint8_t aTapPrev   = NOTE_EMPTY, aTapRow = 0, aTapCol = 0;
 static const uint16_t BPM_MIN = 20;
 static const uint16_t BPM_MAX = 300;
 uint16_t bpm = 80;
+// USB-MIDI sends can block for up to 250ms (AVR core's USB_Send() retries
+// with delay(1) if nothing drains the endpoint) -- if no MIDI host is
+// listening, that stalls playback on every note. Default on for people who
+// do have a host attached; togglable per-session so testing without one
+// doesn't cost anything. Not persisted -- always starts on at boot.
+bool midiEnabled = true;
 
 uint32_t tapTimes[4];
 uint8_t  tapHead = 0, tapFill = 0;
@@ -532,8 +538,12 @@ void drawSettings() {
     else             arduboy.drawCircle(x, 38, 2, WHITE);
   }
 
-  arduboy.setCursor(4, 50);
-  arduboy.print(F("B:back  A:tap"));
+  arduboy.setCursor(4, 46);
+  arduboy.print(F("MIDI "));
+  arduboy.print(midiEnabled ? F("ON ") : F("OFF"));
+
+  arduboy.setCursor(4, 56);
+  arduboy.print(F("B:back A:tap v:midi"));
 }
 
 // ── Draw: Sound ───────────────────────────────────────────────────────────────
@@ -696,11 +706,13 @@ void doTapTempo() {
 
 // ── MIDI helpers ──────────────────────────────────────────────────────────────
 void midiNoteOn(uint8_t ch, uint8_t note, uint8_t vel) {
+  if (!midiEnabled) return;
   midiEventPacket_t ev = {0x09, (uint8_t)(0x90 | (ch - 1)), note, vel};
   MidiUSB.sendMIDI(ev);
 }
 
 void midiNoteOff(uint8_t ch, uint8_t note) {
+  if (!midiEnabled) return;
   midiEventPacket_t ev = {0x08, (uint8_t)(0x80 | (ch - 1)), note, 0};
   MidiUSB.sendMIDI(ev);
 }
@@ -712,7 +724,7 @@ void allMidiOff() {
       colMidiNote[c] = 0xFF;
     }
   }
-  MidiUSB.flush();
+  if (midiEnabled) MidiUSB.flush();
 }
 
 // ── FX Flash driver ───────────────────────────────────────────────────────────
@@ -1050,7 +1062,7 @@ void stepPlay() {
     }
     // NOTE_EMPTY: sustain — leave voice and MIDI note running
   }
-  MidiUSB.flush();
+  if (midiEnabled) MidiUSB.flush();
 
   if (++playStep >= PAT_STEPS) {
     playStep = 0;
@@ -1292,6 +1304,9 @@ void handleSettingsInput() {
       if (checkRepeat(LEFT_BUTTON,  2)) adjustBPM(-1);
       if (checkRepeat(RIGHT_BUTTON, 3)) adjustBPM(+1);
     }
+  } else if (arduboy.justPressed(DOWN_BUTTON)) {
+    midiEnabled = !midiEnabled;
+    if (!midiEnabled) allMidiOff();
   }
 }
 
