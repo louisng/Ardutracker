@@ -199,7 +199,6 @@ bool     playing      = false;
 uint8_t  playRow      = 0, playStep = 0;
 uint8_t  playStartRow = 0;
 uint32_t lastStepMs   = 0;
-uint32_t ledOffAt     = 0;  // millis() timestamp to turn off the tempo LED; 0 = not lit
 
 // C4-B4 frequencies (MIDI 60-71); octave-shift via bit shift
 static const uint16_t NOTE_FREQS[12] PROGMEM = {
@@ -1005,12 +1004,6 @@ void stepPlay() {
   if (now - lastStepMs < stepMs) return;
   lastStepMs += stepMs;
 
-  // Tempo LED: brief flash on each beat (every 4 steps/rows)
-  if (playStep % 4 == 0) {
-    arduboy.setRGBled(0, 60, 0);
-    ledOffAt = now + 60;
-  }
-
   // Gate countdown: cut any ringing voice whose preset has a finite gate
   // length, independent of mute/pattern content this step.
   for (uint8_t c = 0; c < COLS; c++) {
@@ -1091,8 +1084,6 @@ bool handlePlayStop() {
     allMidiOff();
     memset(colVoice,     0xFF, sizeof(colVoice));
     memset(colGateSteps, 0xFF, sizeof(colGateSteps));
-    arduboy.setRGBled(0, 0, 0);
-    ledOffAt = 0;
   }
   resetInputState();
   return true;
@@ -1135,7 +1126,7 @@ void handleTrackerInput() {
       resetInputState();
       screen = SCR_SOUND;
     } else if (arduboy.justPressed(DOWN_BUTTON)) {
-      if (playing) { allVoicesOff(); allMidiOff(); playing = false; memset(colVoice, 0xFF, sizeof(colVoice)); memset(colGateSteps, 0xFF, sizeof(colGateSteps)); arduboy.setRGBled(0, 0, 0); ledOffAt = 0; }
+      if (playing) { allVoicesOff(); allMidiOff(); playing = false; memset(colVoice, 0xFF, sizeof(colVoice)); memset(colGateSteps, 0xFF, sizeof(colGateSteps)); }
       songSlot   = 0;
       songScroll = 0;
       songNaming = false;
@@ -1723,10 +1714,6 @@ void loop() {
   }
 
   if (playing) stepPlay();
-  if (ledOffAt != 0 && millis() >= ledOffAt) {
-    arduboy.setRGBled(0, 0, 0);
-    ledOffAt = 0;
-  }
 
   // Input pass — handlers may change screen; draw pass re-reads screen after
   switch (screen) {
