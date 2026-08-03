@@ -152,11 +152,12 @@ static const uint8_t DEF_PRESET_WAVE[8] PROGMEM = {  0,   0,   0,   1,   3,   0,
 // LD=SQ, BS=SQ, AP=SQ, CH=TR, HI=NO, LO=SQ, PC=NO, PD=TR
 
 // Gate (ring duration): how long a triggered note holds before auto-cutoff,
-// independent of mute. 0-3 = that many quarter notes (4 steps each, 16
-// steps/pattern); 4 = sustain forever (original always-on behavior, still
-// the default so nothing changes unless explicitly set).
-static const char    GATE_NAMES[5][3] PROGMEM = { "1Q","2Q","3Q","4Q","SU" };
-static const uint8_t GATE_STEPS[4]    PROGMEM = { 4, 8, 12, 16 };
+// independent of mute. 0-3 = that many 16th-note pattern rows/steps (4 steps
+// = 1 beat, since a pattern row is a 16th note and BPM counts quarter-note
+// beats); 4 = sustain forever (original always-on behavior, still the
+// default so nothing changes unless explicitly set).
+static const char    GATE_NAMES[5][3] PROGMEM = { "1 ","2 ","3 ","4 ","SU" };
+static const uint8_t GATE_STEPS[4]    PROGMEM = { 1, 2, 3, 4 };
 static const uint8_t GATE_SUSTAIN     = 4;
 static const uint8_t DEF_PRESET_GATE[8] PROGMEM = { GATE_SUSTAIN, GATE_SUSTAIN, GATE_SUSTAIN, GATE_SUSTAIN,
                                                      GATE_SUSTAIN, GATE_SUSTAIN, GATE_SUSTAIN, GATE_SUSTAIN };
@@ -164,7 +165,7 @@ static const uint8_t DEF_PRESET_GATE[8] PROGMEM = { GATE_SUSTAIN, GATE_SUSTAIN, 
 int8_t  presetOct[8];   // editable per-preset octave offset
 uint8_t presetPW[8];    // editable per-preset pulse width (1-8)
 uint8_t presetWave[8];  // editable per-preset waveform (0-3)
-uint8_t presetGate[8];  // editable per-preset gate length (0-3=quarter notes, 4=sustain)
+uint8_t presetGate[8];  // editable per-preset gate length (0-3=that many 16th-note steps, 4=sustain)
 uint8_t editPreset = 0, editParam = 0;  // preset editor state (editParam: 0=OCT,1=PW,2=WAVE,3=GATE)
 
 uint8_t colPreset[COLS] = {1, 4, 2, 3, 0, 5, 6, 7};  // col1=BS(BD), col2=HI(SN)
@@ -1420,7 +1421,7 @@ void drawPreset() {
     }
   }
 
-  // GATE selector row (y=33) — 5 options: 1Q 2Q 3Q 4Q SU
+  // GATE selector row (y=33) — 5 options: 1/2/3/4 (16th-note steps) or SU (sustain)
   arduboy.setTextColor(WHITE);
   bool gateSel = (editParam == 3);
   if (gateSel) { arduboy.fillRect(1, 34, 126, 6, WHITE); arduboy.setTextColor(BLACK); }
