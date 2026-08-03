@@ -635,7 +635,8 @@ static inline void fxDesel() { PORTE |=  (1 << 6); PORTD &= ~(1 << 6); }
 static void fxWaitBusy() {
   fxSel();
   SPI.transfer(0x05);  // RDSR1
-  while (SPI.transfer(0) & 0x01);
+  uint32_t start = millis();
+  while ((SPI.transfer(0) & 0x01) && (millis() - start < 1000)) {}  // bounded: never lock up forever
   fxDesel();
 }
 
@@ -1200,13 +1201,6 @@ void drawSongs() {
   arduboy.setTextColor(WHITE);
   arduboy.setCursor(4, 1);
   arduboy.print(F("SONGS"));
-  if (songNaming) {
-    arduboy.setCursor(40, 1);
-    arduboy.print(F("^v:char <>:cur A:ok"));
-  } else {
-    arduboy.setCursor(40, 1);
-    arduboy.print(F("A:load  A+^:save"));
-  }
 
   // Slot list (5 visible rows at y=10,19,28,37,46)
   for (uint8_t r = 0; r < SONGS_VIS; r++) {
