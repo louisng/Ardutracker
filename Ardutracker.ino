@@ -38,6 +38,37 @@ void resetInputState() {
   aPressClean = false;
 }
 
+// True while `btn` is held alone: no direction pressed yet, and the other
+// modifier button isn't also down (keeps A-held and B-held hints from
+// overlapping during an A+B press/release).
+bool heldAlone(uint8_t btn, uint8_t otherBtn) {
+  return arduboy.pressed(btn) && !arduboy.pressed(otherBtn) &&
+         !arduboy.pressed(UP_BUTTON)   && !arduboy.pressed(DOWN_BUTTON) &&
+         !arduboy.pressed(LEFT_BUTTON) && !arduboy.pressed(RIGHT_BUTTON);
+}
+
+// Full-screen "what does each direction do" overlay, shown while a modifier
+// button is held alone. Pass nullptr for a direction with no binding to
+// leave it out. Disappears automatically once a direction is pressed (the
+// bound action fires) or the modifier is released (draw falls through to
+// the screen's normal content again).
+void drawHeldHint(const __FlashStringHelper* label,
+                   const __FlashStringHelper* up,
+                   const __FlashStringHelper* down,
+                   const __FlashStringHelper* left,
+                   const __FlashStringHelper* right) {
+  arduboy.drawRect(0, 0, 128, 64, WHITE);
+  arduboy.setTextColor(WHITE);
+  arduboy.setCursor(4, 2);
+  arduboy.print(label);
+  arduboy.drawFastHLine(0, 11, 128, WHITE);
+  uint8_t y = 17;
+  if (up)    { arduboy.setCursor(4, y); arduboy.print(F("UP:    ")); arduboy.print(up);    y += 11; }
+  if (down)  { arduboy.setCursor(4, y); arduboy.print(F("DOWN:  ")); arduboy.print(down);  y += 11; }
+  if (left)  { arduboy.setCursor(4, y); arduboy.print(F("LEFT:  ")); arduboy.print(left);  y += 11; }
+  if (right) { arduboy.setCursor(4, y); arduboy.print(F("RIGHT: ")); arduboy.print(right); y += 11; }
+}
+
 // ── Tracker ───────────────────────────────────────────────────────────────────
 static const uint8_t COLS     = 8;
 static const uint8_t ROWS     = 40;
@@ -335,6 +366,18 @@ uint16_t midiToFreq(uint8_t note) {
 
 // ── Draw: Tracker ─────────────────────────────────────────────────────────────
 void drawTracker() {
+  if (heldAlone(B_BUTTON, A_BUTTON)) {
+    uint8_t v = grid[curRow][curCol];
+    bool hasPat = (v != 0xFF && v < MAX_PATS);
+    drawHeldHint(F("B HELD"), F("SOUND"), F("SONGS"), F("SETTINGS"),
+                 hasPat ? F("PATTERN") : nullptr);
+    return;
+  }
+  if (heldAlone(A_BUTTON, B_BUTTON)) {
+    drawHeldHint(F("A HELD"), F("+10"), F("-10"), F("-1"), F("+1"));
+    return;
+  }
+
   for (uint8_t c = 0; c < COLS; c++)
     arduboy.drawFastVLine(c * CELL_W, 0, 64, WHITE);
   arduboy.drawFastVLine(127, 0, 64, WHITE);
@@ -375,6 +418,11 @@ void drawTracker() {
 
 // ── Draw: Pattern ─────────────────────────────────────────────────────────────
 void drawPattern() {
+  if (patCurCol == 0 && heldAlone(A_BUTTON, B_BUTTON)) {
+    drawHeldHint(F("A HELD"), F("+OCT"), F("-OCT"), F("-1"), F("+1"));
+    return;
+  }
+
   arduboy.drawFastVLine(0,   0, 64, WHITE);
   arduboy.drawFastVLine(64,  0, 64, WHITE);
   arduboy.drawFastVLine(127, 0, 64, WHITE);
@@ -421,6 +469,11 @@ void drawPattern() {
 
 // ── Draw: Settings ────────────────────────────────────────────────────────────
 void drawSettings() {
+  if (heldAlone(A_BUTTON, B_BUTTON)) {
+    drawHeldHint(F("A HELD"), F("+10 BPM"), F("-10 BPM"), F("-1 BPM"), F("+1 BPM"));
+    return;
+  }
+
   arduboy.drawRect(0, 0, 128, 64, WHITE);
   arduboy.drawFastHLine(0, 10, 128, WHITE);
 
@@ -452,6 +505,15 @@ void drawSettings() {
 
 // ── Draw: Sound ───────────────────────────────────────────────────────────────
 void drawSound() {
+  if (heldAlone(B_BUTTON, A_BUTTON)) {
+    drawHeldHint(F("B HELD"), F("PRESETS"), nullptr, nullptr, nullptr);
+    return;
+  }
+  if (sndCurRow == 2 && heldAlone(A_BUTTON, B_BUTTON)) {
+    drawHeldHint(F("A HELD"), nullptr, nullptr, F("-1 CH"), F("+1 CH"));
+    return;
+  }
+
   for (uint8_t c = 0; c < COLS; c++)
     arduboy.drawFastVLine(c * CELL_W, 0, 64, WHITE);
   arduboy.drawFastVLine(127, 0, 64, WHITE);
@@ -1186,6 +1248,13 @@ void handleSoundInput() {
 
 // ── Draw: Preset Editor ───────────────────────────────────────────────────────
 void drawPreset() {
+  if (heldAlone(A_BUTTON, B_BUTTON)) {
+    if (editParam == 0)      drawHeldHint(F("A HELD"), nullptr, nullptr, F("-1 OCT"), F("+1 OCT"));
+    else if (editParam == 1) drawHeldHint(F("A HELD"), nullptr, nullptr, F("-1 PW"),  F("+1 PW"));
+    else                     drawHeldHint(F("A HELD"), nullptr, nullptr, F("PREV WAVE"), F("NEXT WAVE"));
+    return;
+  }
+
   uint8_t p = editPreset;
   const uint8_t SX = 26, SW = 72;  // slider start x, total width
 
@@ -1321,6 +1390,11 @@ void handlePresetInput() {
 
 // ── Draw: Song Manager ────────────────────────────────────────────────────────
 void drawSongs() {
+  if (!songNaming && heldAlone(A_BUTTON, B_BUTTON)) {
+    drawHeldHint(F("A HELD"), F("SAVE"), F("RENAME"), nullptr, nullptr);
+    return;
+  }
+
   arduboy.drawRect(0, 0, 128, 64, WHITE);
   arduboy.drawFastHLine(0,  9, 128, WHITE);
   arduboy.drawFastHLine(0, 54, 128, WHITE);
