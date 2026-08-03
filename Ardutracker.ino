@@ -695,6 +695,56 @@ bool fxSlotValid(uint8_t slot) {
   return m[0] == EEPROM_MAGIC0 && m[1] == EEPROM_MAGIC1;
 }
 
+static uint8_t fxReadReg(uint8_t opcode) {
+  fxSel();
+  SPI.transfer(opcode);
+  uint8_t v = SPI.transfer(0);
+  fxDesel();
+  return v;
+}
+
+// Diagnostic screen: JEDEC ID (manufacturer/type/capacity) + status registers.
+// Shown on save failure so we can tell "wrong/no chip" apart from
+// "chip responds but write-protect bits are blocking the write".
+static void fxShowDiag() {
+  uint8_t id[3];
+  fxSel();
+  SPI.transfer(0x9F);  // JEDEC ID
+  id[0] = SPI.transfer(0);
+  id[1] = SPI.transfer(0);
+  id[2] = SPI.transfer(0);
+  fxDesel();
+  uint8_t sr1 = fxReadReg(0x05);
+  uint8_t sr2 = fxReadReg(0x35);
+
+  arduboy.clear();
+  arduboy.setTextColor(WHITE);
+  arduboy.setCursor(4, 4);
+  arduboy.print(F("SAVE FAILED"));
+  arduboy.setCursor(4, 18);
+  arduboy.print(F("JEDEC "));
+  printHex2(id[0]); arduboy.print(' ');
+  printHex2(id[1]); arduboy.print(' ');
+  printHex2(id[2]);
+  arduboy.setCursor(4, 30);
+  arduboy.print(F("SR1 "));
+  printHex2(sr1);
+  arduboy.setCursor(4, 42);
+  arduboy.print(F("SR2 "));
+  printHex2(sr2);
+  arduboy.setCursor(4, 56);
+  arduboy.print(F("press any button"));
+  arduboy.display();
+
+  while (true) {
+    arduboy.pollButtons();
+    if (arduboy.pressed(A_BUTTON) || arduboy.pressed(B_BUTTON) ||
+        arduboy.pressed(UP_BUTTON) || arduboy.pressed(DOWN_BUTTON) ||
+        arduboy.pressed(LEFT_BUTTON) || arduboy.pressed(RIGHT_BUTTON)) break;
+    delay(20);
+  }
+}
+
 void refreshSongCache() {
   songCacheValid = 0;
   for (uint8_t r = 0; r < SONGS_VIS; r++) {
@@ -771,9 +821,10 @@ void fxSaveSlot(uint8_t slot, const char* name6) {
   uint8_t check[8];
   fxRead(base, check, 8);
   bool ok = (check[0] == EEPROM_MAGIC0 && check[1] == EEPROM_MAGIC1);
+  if (!ok) { fxShowDiag(); return; }
   arduboy.clear();
   arduboy.setCursor(16, 28);
-  arduboy.print(ok ? F("SAVE OK") : F("SAVE FAILED"));
+  arduboy.print(F("SAVE OK"));
   arduboy.display();
   delay(600);
 }
