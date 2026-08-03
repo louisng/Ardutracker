@@ -632,8 +632,33 @@ void allMidiOff() {
 // selected — otherwise the display latches our flash opcodes as its own
 // command/data stream (e.g. 0x40-0x7F reads as "set display start line"),
 // which is what produces the endless shifting/scrolling look.
-static inline void fxSel()   { PORTD |=  (1 << 6); PORTE &= ~(1 << 6); }
-static inline void fxDesel() { PORTE |=  (1 << 6); PORTD &= ~(1 << 6); }
+//
+// The flash chip's own CS pin differs across Arduboy FX hardware revisions
+// (per the official MrBlinky/ArduboyFX library: PD1 by default, PD2 when
+// built with CART_CS_RX, or PE2 when built with CART_CS_HWB -- there's no
+// single fixed pin). Since we don't know which revision this board is,
+// probe all three at boot and lock onto whichever one gets a real JEDEC ID
+// back from the chip.
+enum FxCsSel : uint8_t { FXCS_PD1, FXCS_PD2, FXCS_PE2 };
+static FxCsSel fxCsSel = FXCS_PD1;
+
+static inline void fxCsAssert() {
+  switch (fxCsSel) {
+    case FXCS_PD1: PORTD &= ~(1 << 1); break;
+    case FXCS_PD2: PORTD &= ~(1 << 2); break;
+    case FXCS_PE2: PORTE &= ~(1 << 2); break;
+  }
+}
+static inline void fxCsDeassert() {
+  switch (fxCsSel) {
+    case FXCS_PD1: PORTD |= (1 << 1); break;
+    case FXCS_PD2: PORTD |= (1 << 2); break;
+    case FXCS_PE2: PORTE |= (1 << 2); break;
+  }
+}
+
+static inline void fxSel()   { PORTD |= (1 << 6); fxCsAssert(); }
+static inline void fxDesel() { fxCsDeassert(); PORTD &= ~(1 << 6); }
 
 static void fxWaitBusy() {
   fxSel();
@@ -647,10 +672,34 @@ static void fxWren() {
   fxSel(); SPI.transfer(0x06); fxDesel();  // Write Enable
 }
 
+// Try each candidate CS pin and keep whichever returns a real Winbond
+// JEDEC ID (0xEF ...). Falls back to the first candidate with any
+// non-trivial (not all-0x00 / all-0xFF) response, else leaves the default.
+static void fxDetectCS() {
+  static const FxCsSel candidates[3] = { FXCS_PD1, FXCS_PD2, FXCS_PE2 };
+  int8_t fallback = -1;
+  for (uint8_t i = 0; i < 3; i++) {
+    fxCsSel = candidates[i];
+    uint8_t id0;
+    fxSel();
+    SPI.transfer(0x9F);
+    id0 = SPI.transfer(0);
+    SPI.transfer(0);
+    SPI.transfer(0);
+    fxDesel();
+    if (id0 == 0xEF) return;                                   // confirmed Winbond
+    if (fallback < 0 && id0 != 0x00 && id0 != 0xFF) fallback = i;
+  }
+  fxCsSel = (fallback >= 0) ? candidates[fallback] : FXCS_PD1;
+}
+
 void fxBegin() {
-  DDRE  |=  (1 << 6);   // PE6 = Arduino pin 7 = FX flash CS
-  PORTE |=  (1 << 6);   // CS deselected (high)
+  DDRD  |=  (1 << 1) | (1 << 2);
+  PORTD |=  (1 << 1) | (1 << 2);   // both PD candidates deselected (high)
+  DDRE  |=  (1 << 2);
+  PORTE |=  (1 << 2);              // PE2 candidate deselected (high)
   SPI.begin();
+  fxDetectCS();
 }
 
 void fxRead(uint32_t addr, void* buf, uint16_t len) {
@@ -720,7 +769,8 @@ static void fxShowDiag() {
   arduboy.clear();
   arduboy.setTextColor(WHITE);
   arduboy.setCursor(4, 4);
-  arduboy.print(F("SAVE FAILED"));
+  arduboy.print(F("SAVE FAILED  CS:"));
+  arduboy.print(fxCsSel == FXCS_PD1 ? F("PD1") : fxCsSel == FXCS_PD2 ? F("PD2") : F("PE2"));
   arduboy.setCursor(4, 18);
   arduboy.print(F("JEDEC "));
   printHex2(id[0]); arduboy.print(' ');
