@@ -122,6 +122,7 @@ static const uint8_t NOTE_MAX    = 107;
 
 uint8_t patNote[MAX_PATS][PAT_STEPS];
 uint8_t openPat = 0, patCurCol = 0, patCurRow = 0, patScroll = 0;
+uint8_t openPatCol = 0;  // tracker column this pattern was opened from; used for preview sound
 uint8_t patLastNote = 60;
 
 uint8_t aTapTimer  = 0;
@@ -214,6 +215,8 @@ volatile uint8_t  voiceWave[MAX_VOICES];  // 0=square, 1=triangle, 2=sawtooth, 3
 volatile int16_t  voiceErr[MAX_VOICES];   // PDM error accumulators for TR/SA
 uint8_t colVoice[COLS];  // 0xFF = no voice assigned
 uint8_t colGateSteps[COLS];  // steps remaining before auto-off; 0xFF = sustain (no timeout)
+uint8_t  previewVoice = 0xFF;  // Pattern-screen A-held note preview; 0xFF = none sounding
+uint32_t previewOffAt = 0;     // millis() timestamp for gate auto-cutoff; 0 = no timeout (sustain)
 
 ISR(TIMER3_COMPA_vect) {
   static uint16_t ph[MAX_VOICES];
@@ -296,6 +299,7 @@ uint8_t findFreeVoice() {
   for (uint8_t c = 0; c < COLS; c++) {
     if (colVoice[c] < MAX_VOICES) busy[colVoice[c]] = true;
   }
+  if (previewVoice < MAX_VOICES) busy[previewVoice] = true;
   for (uint8_t v = 0; v < MAX_VOICES; v++) {
     if (!busy[v]) return v;
   }
@@ -1065,6 +1069,7 @@ bool handlePlayStop() {
   bool abFire = (arduboy.justPressed(A_BUTTON) && arduboy.pressed(B_BUTTON)) ||
                 (arduboy.justPressed(B_BUTTON) && arduboy.pressed(A_BUTTON));
   if (!abFire) return false;
+  stopNotePreview();
   playing = !playing;
   if (playing) {
     playStartRow = curRow;
@@ -1132,6 +1137,7 @@ void handleTrackerInput() {
       uint8_t val = grid[curRow][curCol];
       if (val != 0xFF && val < MAX_PATS) {
         openPat     = val;
+        openPatCol  = curCol;
         patCurRow   = 0;
         patCurCol   = 0;
         patScroll   = 0;
@@ -1162,15 +1168,57 @@ void handleTrackerInput() {
   }
 }
 
+// ── Note preview (Pattern screen, A-held) ─────────────────────────────────────
+// Uses the preset assigned to the column this pattern was opened from, so it
+// sounds exactly like it would during real playback (same octave, pulse
+// width, waveform, and gate length).
+void stopNotePreview() {
+  if (previewVoice < MAX_VOICES) { voiceOff(previewVoice); previewVoice = 0xFF; }
+  previewOffAt = 0;
+}
+
+void startNotePreview(uint8_t note) {
+  stopNotePreview();
+  if (note == NOTE_EMPTY || note == NOTE_MUTE) return;
+  uint8_t preset = colPreset[openPatCol];
+  int8_t  oct    = presetOct[preset];
+  int16_t adj    = (int16_t)note + (int16_t)oct * 12;
+  if (adj < NOTE_MIN) adj = NOTE_MIN;
+  if (adj > NOTE_MAX) adj = NOTE_MAX;
+  uint16_t freq = midiToFreq((uint8_t)adj);
+  if (freq == 0) return;
+  uint8_t v = findFreeVoice();
+  if (v >= MAX_VOICES) return;  // no free voice -- silently skip preview
+  uint8_t pw   = (uint8_t)((uint16_t)presetPW[preset] * 32 - 1);
+  uint8_t wave = presetWave[preset];
+  previewVoice = v;
+  voiceOn(v, freq, pw, wave);
+  uint8_t gate = presetGate[preset];
+  if (gate == GATE_SUSTAIN) {
+    previewOffAt = 0;  // rings for as long as A is held
+  } else {
+    uint32_t stepMs = 60000UL / bpm / 4;
+    uint32_t steps  = pgm_read_byte(&GATE_STEPS[gate]);
+    uint32_t offAt  = millis() + stepMs * steps;
+    previewOffAt = (offAt == 0) ? 1 : offAt;  // 0 is the sustain sentinel, nudge off it
+  }
+}
+
 // ── Input: Pattern ────────────────────────────────────────────────────────────
 void handlePatternInput() {
   if (aTapTimer > 0) aTapTimer--;
+
+  // Cut the preview the instant its gate expires, even while A is still held
+  if (previewVoice < MAX_VOICES && previewOffAt != 0 && millis() >= previewOffAt) {
+    stopNotePreview();
+  }
 
   // Capture release state before any resetInputState() call clears aPressClean
   bool justRelA = arduboy.justReleased(A_BUTTON);
   bool wasClean = aPressClean;
 
   if (arduboy.justPressed(B_BUTTON)) {
+    stopNotePreview();
     aTapActive  = false;
     aTapTimer   = 0;
     patLastNote = 60;
@@ -1187,10 +1235,11 @@ void handlePatternInput() {
 
   if (aHeld) {
     if (arduboy.justPressed(A_BUTTON)) {
-      // Store non-empty note to memory immediately on press
+      // Store non-empty note to memory immediately on press, and preview it
       if (patCurCol == 0) {
         uint8_t n = patNote[openPat][patCurRow];
         if (n != NOTE_EMPTY && n != NOTE_MUTE) patLastNote = n;
+        startNotePreview(n);
       }
       aPressClean = noDir;
     } else if (patCurCol == 0 && !noDir) {
@@ -1201,8 +1250,10 @@ void handlePatternInput() {
       if (checkRepeat(DOWN_BUTTON,  1)) editPatNote(-12);
       if (checkRepeat(LEFT_BUTTON,  2)) editPatNote(-1);
       if (checkRepeat(RIGHT_BUTTON, 3)) editPatNote(+1);
+      startNotePreview(patNote[openPat][patCurRow]);  // re-sound the edited note
     }
   } else {
+    if (justRelA) stopNotePreview();
     if (justRelA && wasClean && patCurCol == 0) handleATap();  // paste/clear on release
     if (checkRepeat(UP_BUTTON, 0) && patCurRow > 0) {
       patCurRow--;
