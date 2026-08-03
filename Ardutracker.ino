@@ -121,7 +121,8 @@ uint8_t songScroll  = 0;   // scroll offset for song list
 bool    songNaming  = false;
 uint8_t songNameCur = 0;   // cursor within name (0-5)
 char    songEditName[7];   // name being edited (null-terminated)
-static uint8_t songCache[SONGS_VIS][8];  // cached slot headers, refreshed on entry/scroll/save
+static char    songCacheName[SONGS_VIS][6];  // cached slot names, refreshed on entry/scroll/save
+static uint8_t songCacheValid;                // bit r set = row r has a valid saved song
 
 // ── Playback ──────────────────────────────────────────────────────────────────
 bool     playing      = false;
@@ -305,19 +306,21 @@ void setup() {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+static const char HEX_DIGITS[] PROGMEM = "0123456789ABCDEF";
+
 void printHex2(uint8_t val) {
-  static const char h[] = "0123456789ABCDEF";
-  arduboy.print(h[(val >> 4) & 0xF]);
-  arduboy.print(h[val & 0xF]);
+  arduboy.print((char)pgm_read_byte(&HEX_DIGITS[(val >> 4) & 0xF]));
+  arduboy.print((char)pgm_read_byte(&HEX_DIGITS[val & 0xF]));
 }
 
+static const char NOTE_NAMES[12][2] PROGMEM = {
+  {'C',' '},{'C','#'},{'D',' '},{'D','#'},{'E',' '},{'F',' '},
+  {'F','#'},{'G',' '},{'G','#'},{'A',' '},{'A','#'},{'B',' '}
+};
+
 void printNote(uint8_t note) {
-  static const char names[12][2] = {
-    {'C',' '},{'C','#'},{'D',' '},{'D','#'},{'E',' '},{'F',' '},
-    {'F','#'},{'G',' '},{'G','#'},{'A',' '},{'A','#'},{'B',' '}
-  };
-  arduboy.print(names[note % 12][0]);
-  arduboy.print(names[note % 12][1]);
+  arduboy.print((char)pgm_read_byte(&NOTE_NAMES[note % 12][0]));
+  arduboy.print((char)pgm_read_byte(&NOTE_NAMES[note % 12][1]));
   arduboy.print((char)('0' + note / 12 - 1));
 }
 
@@ -693,12 +696,16 @@ bool fxSlotValid(uint8_t slot) {
 }
 
 void refreshSongCache() {
+  songCacheValid = 0;
   for (uint8_t r = 0; r < SONGS_VIS; r++) {
     uint8_t s = r + songScroll;
-    if (s < SONG_SLOTS)
-      fxRead(FX_SONG_BASE + (uint32_t)s * FX_SLOT_SIZE, songCache[r], 8);
-    else
-      memset(songCache[r], 0, 8);
+    if (s >= SONG_SLOTS) continue;
+    uint8_t hdr[8];
+    fxRead(FX_SONG_BASE + (uint32_t)s * FX_SLOT_SIZE, hdr, 8);
+    if (hdr[0] == EEPROM_MAGIC0 && hdr[1] == EEPROM_MAGIC1) {
+      songCacheValid |= (uint8_t)(1 << r);
+      memcpy(songCacheName[r], hdr + 2, 6);
+    }
   }
 }
 
@@ -713,15 +720,15 @@ void fxLoadSlot(uint8_t slot) {
 
   fxRead(base + 8,   (uint8_t*)grid,    sizeof(grid));
   fxRead(base + 328, (uint8_t*)patNote, sizeof(patNote));
-  uint8_t misc[50];
-  fxRead(base + 840, misc, 50);
-  bpm = (uint16_t)misc[0] | ((uint16_t)misc[1] << 8);
-  memcpy(colPreset,  misc +  2, 8);
-  memcpy(colMute,    misc + 10, 8);
-  memcpy(colMidi,    misc + 18, 8);
-  memcpy(presetOct,  misc + 26, 8);
-  memcpy(presetPW,   misc + 34, 8);
-  memcpy(presetWave, misc + 42, 8);
+  uint8_t bpmBytes[2];
+  fxRead(base + 840, bpmBytes, 2);
+  bpm = (uint16_t)bpmBytes[0] | ((uint16_t)bpmBytes[1] << 8);
+  fxRead(base + 842, colPreset,             8);
+  fxRead(base + 850, colMute,               8);
+  fxRead(base + 858, colMidi,               8);
+  fxRead(base + 866, (uint8_t*)presetOct,   8);
+  fxRead(base + 874, presetPW,              8);
+  fxRead(base + 882, presetWave,            8);
 }
 
 void fxSaveSlot(uint8_t slot, const char* name6) {
@@ -736,9 +743,9 @@ void fxSaveSlot(uint8_t slot, const char* name6) {
   fxEraseSector(base);
 
   // Page 0 (bytes 0-255): magic(2) + name(6) + grid[0..247](248)
-  uint8_t hdr[8] = { EEPROM_MAGIC0, EEPROM_MAGIC1 };
-  memcpy(hdr + 2, name6, 6);
-  fxWriteSmall(base,     hdr,               8);
+  uint8_t magic[2] = { EEPROM_MAGIC0, EEPROM_MAGIC1 };
+  fxWriteSmall(base,     magic,             2);
+  fxWriteSmall(base + 2, (const uint8_t*)name6, 6);
   fxWriteSmall(base + 8, (uint8_t*)grid,  248);
 
   // Page 1 (bytes 256-511): grid[248..319](72) + patNote[0..183](184)
@@ -749,18 +756,16 @@ void fxSaveSlot(uint8_t slot, const char* name6) {
   fxWriteSmall(base + 512, (uint8_t*)patNote + 184, 128);
   fxWriteSmall(base + 640, (uint8_t*)patNote + 312, 128);
 
-  // Page 3 (bytes 768-1023): patNote[440..511](72) + misc(50)
+  // Page 3 (bytes 768-1023): patNote[440..511](72) + misc fields(50)
   fxWriteSmall(base + 768, (uint8_t*)patNote + 440, 72);
-  uint8_t misc[50];
-  misc[0] = (uint8_t)(bpm & 0xFF);
-  misc[1] = (uint8_t)(bpm >> 8);
-  memcpy(misc +  2, colPreset,  8);
-  memcpy(misc + 10, colMute,    8);
-  memcpy(misc + 18, colMidi,    8);
-  memcpy(misc + 26, presetOct,  8);
-  memcpy(misc + 34, presetPW,   8);
-  memcpy(misc + 42, presetWave, 8);
-  fxWriteSmall(base + 840, misc, 50);
+  uint8_t bpmBytes[2] = { (uint8_t)(bpm & 0xFF), (uint8_t)(bpm >> 8) };
+  fxWriteSmall(base + 840, bpmBytes,              2);
+  fxWriteSmall(base + 842, colPreset,             8);
+  fxWriteSmall(base + 850, colMute,               8);
+  fxWriteSmall(base + 858, colMidi,               8);
+  fxWriteSmall(base + 866, (uint8_t*)presetOct,   8);
+  fxWriteSmall(base + 874, presetPW,              8);
+  fxWriteSmall(base + 882, presetWave,            8);
 }
 
 // ── Character helpers for slot naming ─────────────────────────────────────────
@@ -1238,10 +1243,9 @@ void drawSongs() {
         }
       }
     } else {
-      uint8_t *hdr = songCache[r];
       arduboy.setCursor(21, y + 1);
-      if (hdr[0] == EEPROM_MAGIC0 && hdr[1] == EEPROM_MAGIC1) {
-        for (uint8_t i = 0; i < 6; i++) arduboy.print((char)hdr[i + 2]);
+      if (songCacheValid & (1 << r)) {
+        for (uint8_t i = 0; i < 6; i++) arduboy.print(songCacheName[r][i]);
       } else {
         arduboy.print(F("------"));
       }
