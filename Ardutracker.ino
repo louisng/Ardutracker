@@ -135,10 +135,10 @@ static const uint16_t BPM_MAX = 300;
 uint16_t bpm = 80;
 // USB-MIDI sends can block for up to 250ms (AVR core's USB_Send() retries
 // with delay(1) if nothing drains the endpoint) -- if no MIDI host is
-// listening, that stalls playback on every note. Default on for people who
-// do have a host attached; togglable per-session so testing without one
-// doesn't cost anything. Not persisted -- always starts on at boot.
-bool midiEnabled = true;
+// listening, that stalls playback on every note. Default off, since most
+// sessions don't have a receiver attached; turn it on from Settings once
+// something's actually listening. Not persisted -- always starts off at boot.
+bool midiEnabled = false;
 
 uint32_t tapTimes[4];
 uint8_t  tapHead = 0, tapFill = 0;
